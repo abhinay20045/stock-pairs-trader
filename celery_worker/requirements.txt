@@ -1,0 +1,4 @@
+celery
+yfinance
+scikit-learn
+pymongo

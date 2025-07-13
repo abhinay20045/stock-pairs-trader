@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  flask:
+    build: ./flask_app
+    ports:
+      - "5000:5000"
+    environment:
+      - MONGO_URL=mongodb://mongo:27017
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - mongo
+      - redis
+
+  celery:
+    build: ./celery_worker
+    depends_on:
+      - flask
+      - redis
+      - mongo
+    environment:
+      - MONGO_URL=mongodb://mongo:27017
+      - REDIS_URL=redis://redis:6379/0
+
+  mongo:
+    image: mongo:5
+    ports:
+      - "27017:27017"
+
+  redis:
+    image: redis:6
+    ports:
+      - "6379:6379"
