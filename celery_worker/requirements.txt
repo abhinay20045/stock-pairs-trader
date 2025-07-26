@@ -1,5 +1,4 @@
 celery
-redis
 yfinance
-scikit-learn
 pymongo
+redis

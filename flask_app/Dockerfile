@@ -1,10 +1,8 @@
 FROM python:3.11-slim
 
 WORKDIR /app
-
-COPY requirements.txt .
+COPY flask_app/ /app/
+COPY celery_worker/ /app/celery_worker/
 RUN pip install -r requirements.txt
-
-COPY . .
 
 CMD ["python", "app.py"]

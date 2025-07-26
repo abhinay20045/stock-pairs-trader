@@ -1,10 +1,7 @@
 FROM python:3.11-slim
 
 WORKDIR /app
+COPY celery_worker/ /app/celery_worker/
+RUN pip install -r /app/celery_worker/requirements.txt
 
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-
-COPY . .
-
-CMD ["celery", "-A", "tasks", "worker", "--loglevel=info"]
+CMD ["celery", "-A", "celery_worker.tasks", "worker", "--loglevel=info"]
