@@ -1,4 +1,5 @@
-from flask import Flask, jsonify
+from celery import chain
+from flask import Flask, Response, json, jsonify
 from pymongo import MongoClient
 from routes.pair_routes import pair_bp
 from celery_worker.tasks import fetch_and_store_prices  # ✅ Import the task
@@ -21,12 +22,12 @@ def test_db():
 
 @app.route("/run-task")
 def run_task():
-    # Step 1: Fetch and store prices (async)
-    fetch_and_store_prices.delay("AAPL", "MSFT")
-    # Step 2: Align and extract close prices (async)
     from celery_worker.tasks import align_and_extract_close_prices
-    result = align_and_extract_close_prices.delay()
-    return jsonify({"task_id": result.id, "status": "submitted for alignment and extraction"})
+    result = chain(fetch_and_store_prices.s("AAPL", "MSFT"), align_and_extract_close_prices.s()).apply_async()
+    return Response(
+    json.dumps({"task_id": result.id, "status": "submitted for alignment and extraction"}, default=str),
+    mimetype='application/json'
+)
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0")

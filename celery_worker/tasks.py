@@ -21,16 +21,18 @@ def fetch_and_store_prices(stock1, stock2):
             print("No data fetched from yfinance!")
             return "No data fetched from yfinance!"
         for symbol in [stock1, stock2]:
-            if (symbol, 'Close') in data.columns:
-                symbol_data = data.xs(symbol, axis=1, level=1, drop_level=False)
-            else:
-                symbol_data = data
-            # Flatten columns to string keys for MongoDB
-            symbol_data.columns = [f"{col[1]}_{col[0]}" for col in symbol_data.columns]
+            # Get only that symbol's data (drops to single-level columns)
+            symbol_data = data.xs(symbol, axis=1, level=1)
+            symbol_data = symbol_data.reset_index()
+            # Rename columns to be unique: e.g., AAPL_Close
+            symbol_data.columns = ["Date"] + [f"{symbol}_{col}" for col in symbol_data.columns if col != "Date"]
+
+            assert symbol_data.columns.is_unique, f"Non-unique columns for {symbol}!"
             print(f"Inserting data for {symbol}, rows: {symbol_data.shape[0]}")
+            
             db.price_data.update_one(
                 {"symbol": symbol, "start": "2022-01-01", "end": "2023-01-01"},
-                {"$set": {"data": symbol_data.reset_index().to_dict("records")}},
+                {"$set": {"data": symbol_data.to_dict("records")}},
                 upsert=True
             )
         print(f"Successfully stored prices for {stock1} and {stock2}")
@@ -40,7 +42,7 @@ def fetch_and_store_prices(stock1, stock2):
         return f"Error: {e}"
 
 @app.task
-def align_and_extract_close_prices():
+def align_and_extract_close_prices(_):
     client = MongoClient("mongodb://mongo:27017")
     db = client["trading_db"]
     # Get the price data for AAPL and MSFT
@@ -63,7 +65,8 @@ def align_and_extract_close_prices():
     # Create aligned numpy arrays
     AAPL_prices = merged["AAPL_Close"].to_numpy()
     MSFT_prices = merged["MSFT_Close"].to_numpy()
-    print(f"Aligned {len(AAPL_prices)} dates.")
+    print("Sample AAPL:", AAPL_prices[:10])
+    print("Sample MSFT:", MSFT_prices[:10])
     return {
         "dates": merged["Date"].dt.strftime("%Y-%m-%d").tolist(),
         "AAPL_prices": AAPL_prices.tolist(),
