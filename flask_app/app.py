@@ -21,8 +21,12 @@ def test_db():
 
 @app.route("/run-task")
 def run_task():
-    result = fetch_and_store_prices.delay("AAPL", "MSFT")  # ✅ Async task call
-    return jsonify({"task_id": result.id, "status": "submitted"})
+    # Step 1: Fetch and store prices (async)
+    fetch_and_store_prices.delay("AAPL", "MSFT")
+    # Step 2: Align and extract close prices (async)
+    from celery_worker.tasks import align_and_extract_close_prices
+    result = align_and_extract_close_prices.delay()
+    return jsonify({"task_id": result.id, "status": "submitted for alignment and extraction"})
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0")

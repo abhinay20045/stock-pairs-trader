@@ -1,6 +1,7 @@
 from celery import Celery
 import yfinance as yf
 from pymongo import MongoClient
+import pandas as pd
 
 # Create Celery app
 app = Celery(
@@ -25,7 +26,7 @@ def fetch_and_store_prices(stock1, stock2):
             else:
                 symbol_data = data
             # Flatten columns to string keys for MongoDB
-            symbol_data.columns = ['_'.join([str(i) for i in col if i]) for col in symbol_data.columns.values]
+            symbol_data.columns = [f"{col[1]}_{col[0]}" for col in symbol_data.columns]
             print(f"Inserting data for {symbol}, rows: {symbol_data.shape[0]}")
             db.price_data.update_one(
                 {"symbol": symbol, "start": "2022-01-01", "end": "2023-01-01"},
@@ -37,3 +38,34 @@ def fetch_and_store_prices(stock1, stock2):
     except Exception as e:
         print(f"Error in fetch_and_store_prices: {e}")
         return f"Error: {e}"
+
+@app.task
+def align_and_extract_close_prices():
+    client = MongoClient("mongodb://mongo:27017")
+    db = client["trading_db"]
+    # Get the price data for AAPL and MSFT
+    aapl_doc = db.price_data.find_one({"symbol": "AAPL"})
+    msft_doc = db.price_data.find_one({"symbol": "MSFT"})
+    if not aapl_doc or not msft_doc:
+        print("AAPL or MSFT data not found in MongoDB.")
+        return None
+    aapl_df = pd.DataFrame(aapl_doc["data"])
+    msft_df = pd.DataFrame(msft_doc["data"])
+    # Extract Date and Close columns
+    aapl_df = aapl_df[["Date", "AAPL_Close"]]
+    msft_df = msft_df[["Date", "MSFT_Close"]]
+    aapl_df["Date"] = pd.to_datetime(aapl_df["Date"])
+    msft_df["Date"] = pd.to_datetime(msft_df["Date"])
+    aapl_df = aapl_df.sort_values("Date")
+    msft_df = msft_df.sort_values("Date")
+    # Merge on Date (inner join for intersection)
+    merged = pd.merge(aapl_df, msft_df, on="Date", how="inner")
+    # Create aligned numpy arrays
+    AAPL_prices = merged["AAPL_Close"].to_numpy()
+    MSFT_prices = merged["MSFT_Close"].to_numpy()
+    print(f"Aligned {len(AAPL_prices)} dates.")
+    return {
+        "dates": merged["Date"].dt.strftime("%Y-%m-%d").tolist(),
+        "AAPL_prices": AAPL_prices.tolist(),
+        "MSFT_prices": MSFT_prices.tolist()
+    }
