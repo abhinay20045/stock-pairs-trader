@@ -23,6 +23,19 @@ services:
       - redis
     environment:
       - PYTHONPATH=/app
+    
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: celery_worker/Dockerfile
+    command: celery -A celery_worker.tasks beat --loglevel=info
+    volumes:
+      - .:/app
+    depends_on:
+      - redis
+    environment:
+      - PYTHONPATH=/app
 
 
   mongo:

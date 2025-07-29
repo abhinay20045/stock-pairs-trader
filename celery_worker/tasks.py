@@ -1,9 +1,10 @@
-from celery import Celery
+from celery import Celery, chain
 import yfinance as yf
 from pymongo import MongoClient
 import pandas as pd
+from flask import Response, json
 
-# Create Celery app
+
 app = Celery(
     "tasks",
     broker="redis://redis:6379/0"
@@ -72,3 +73,12 @@ def align_and_extract_close_prices(_):
         "AAPL_prices": AAPL_prices.tolist(),
         "MSFT_prices": MSFT_prices.tolist()
     }
+
+@app.task
+def trigger_chain():
+    result = chain(fetch_and_store_prices.s("AAPL", "MSFT"), align_and_extract_close_prices.s()).apply_async()
+    return Response(
+    json.dumps({"task_id": result.id, "status": "submitted for alignment and extraction"}, default=str),
+    mimetype='application/json'
+)
+app.config_from_object("celery_worker.celeryconfig") 

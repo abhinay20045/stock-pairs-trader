@@ -2,3 +2,5 @@ celery[redis]
 yfinance
 pymongo
 pandas
+pytz
+Flask
