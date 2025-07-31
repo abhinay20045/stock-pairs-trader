@@ -3,3 +3,4 @@ pymongo
 celery
 redis
 yfinance
+flask_cors
