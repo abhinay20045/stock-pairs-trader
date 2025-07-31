@@ -132,7 +132,7 @@ def calculate_spread_and_zscore(_=None):
 
     if not aapl_docs or not msft_docs:
         print("Missing price data")
-        return None
+        return {"error": "Missing price data"}
 
     aapl_df = pd.DataFrame(aapl_docs)
     msft_df = pd.DataFrame(msft_docs)
@@ -150,7 +150,7 @@ def calculate_spread_and_zscore(_=None):
 
     if merged.shape[0] < 30:
         print("Not enough data points for Z-score")
-        return None
+        return {"error": "Not enough data points for Z-score"}
 
     recent_data = merged.iloc[-30:]
     spread_series = recent_data["spread"]
@@ -159,7 +159,7 @@ def calculate_spread_and_zscore(_=None):
 
     if std == 0:
         print("Standard deviation is zero, skipping Z-score calculation")
-        return None
+        return {"error": "Standard deviation is zero"}
 
     z_score = (spread_series.iloc[-1] - mean) / std
 
@@ -171,18 +171,107 @@ def calculate_spread_and_zscore(_=None):
         "z_score": z_score,
     }
 
-    db.spread_data.insert_one(record)
+    insert_result = db.spread_data.insert_one(record)
+    record["_id"] = str(insert_result.inserted_id)  # Convert ObjectId to string
+
     print(f"Inserted spread record: {record}")
     return record
+
+@app.task
+def evaluate_and_place_trade(_=None):
+    from pymongo import MongoClient
+    from bson.objectid import ObjectId
+
+    client = MongoClient("mongodb://mongo:27017")
+    db = client["trading_db"]
+
+    print("🔍 [Trade Eval] Starting trade evaluation...")
+
+    # Fetch latest z-score record
+    latest = db.spread_data.find_one(sort=[("timestamp", -1)])
+    if not latest:
+        print("⚠️ [Trade Eval] No z-score data found in spread_data.")
+        return None
+
+    z_score = latest["z_score"]
+    aapl_price = latest["aapl_price"]
+    msft_price = latest["msft_price"]
+    spread = latest["spread"]
+    timestamp = latest["timestamp"]
+
+    print(f"📊 [Trade Eval] Latest Data — Z-score: {z_score}, AAPL: {aapl_price}, MSFT: {msft_price}, Spread: {spread}, Time: {timestamp}")
+
+    # Check for open trade
+    open_trade = db.trades.find_one({"status": "open"}, sort=[("timestamp", -1)])
+
+    if open_trade:
+        print(f"🟡 [Trade Eval] Found open trade: {open_trade['action']} from {open_trade['timestamp']}")
+    else:
+        print("✅ [Trade Eval] No open trades.")
+
+    trade_action = None
+    new_trade = {}
+
+    if not open_trade:
+        if z_score > 1.0:
+            trade_action = "short_aapl_long_msft"
+        elif z_score < -1.0:
+            trade_action = "long_aapl_short_msft"
+
+        if trade_action:
+            new_trade = {
+                "timestamp": timestamp,
+                "action": trade_action,
+                "aapl_price": aapl_price,
+                "msft_price": msft_price,
+                "spread": spread,
+                "z_score": z_score,
+                "status": "open"
+            }
+            db.trades.insert_one(new_trade)
+            print(f"🟢 [Trade Placed] {trade_action} at Z-score: {z_score}")
+        else:
+            print("ℹ️ [Trade Eval] Z-score does not exceed entry threshold. No trade placed.")
+    else:
+        should_close = (
+            (open_trade["action"] == "long_aapl_short_msft" and z_score >= 0) or
+            (open_trade["action"] == "short_aapl_long_msft" and z_score <= 0)
+        )
+
+        if should_close:
+            if open_trade["action"] == "long_aapl_short_msft":
+                pnl = (aapl_price - open_trade["aapl_price"]) - (msft_price - open_trade["msft_price"])
+            else:
+                pnl = (msft_price - open_trade["msft_price"]) - (aapl_price - open_trade["aapl_price"])
+
+            db.trades.update_one({"_id": open_trade["_id"]}, {"$set": {"status": "closed"}})
+
+            new_trade = {
+                "timestamp": timestamp,
+                "action": "close",
+                "aapl_price": aapl_price,
+                "msft_price": msft_price,
+                "spread": spread,
+                "z_score": z_score,
+                "status": "closed",
+                "entry_trade_id": open_trade["_id"],
+                "pnl": pnl
+            }
+            db.trades.insert_one(new_trade)
+            print(f"🔴 [Trade Closed] Closed trade from {open_trade['timestamp']} | PnL: {pnl:.2f}")
+        else:
+            print(f"ℹ️ [Trade Eval] Z-score has not reverted enough to close. Current: {z_score}")
+
+    return new_trade if new_trade else "No action taken."
+
 
 
 @app.task
 def trigger_chain():
     result = chain(
         fetch_and_store_prices.s("AAPL", "MSFT"),
-        align_and_extract_close_prices.s()
+        align_and_extract_close_prices.s(), calculate_spread_and_zscore.s(), evaluate_and_place_trade.s()
     ).apply_async()
     return {"task_id": result.id, "status": "submitted for alignment and extraction"}
-
 
 app.config_from_object("celery_worker.celeryconfig")
