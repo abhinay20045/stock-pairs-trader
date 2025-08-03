@@ -15,17 +15,32 @@ ChartJS.register(LineElement, CategoryScale, LinearScale, PointElement, Tooltip,
 
 export default function Dashboard() {
   const [data, setData] = useState(null);
+  const [priceData, setPriceData] = useState(null);
 
   useEffect(() => {
     async function fetchData() {
-      const res = await fetch("http://localhost:5050/trade-history");
-      const json = await res.json();
-      setData(json);
+      try {
+        const [tradeRes, priceRes] = await Promise.all([
+          fetch("http://localhost:5050/trade-history"),
+          fetch("http://localhost:5050/prices?symbols=AAPL,MSFT&limit=5000")
+        ]);
+        
+        const tradeJson = await tradeRes.json();
+        const priceJson = await priceRes.json();
+        
+        setData(tradeJson);
+        setPriceData(priceJson);
+      } catch (error) {
+        console.error("Error fetching data:", error);
+      }
     }
+    
     fetchData();
+    const interval = setInterval(fetchData, 5000); // Update every 5 seconds
+    return () => clearInterval(interval);
   }, []);
 
-  if (!data) return <div className="text-center p-6">Loading...</div>;
+  if (!data || !priceData) return <div className="text-center p-6">Loading...</div>;
 
   const chartData = {
     labels: data.map(d => new Date(d.timestamp).toLocaleDateString()),
@@ -47,6 +62,30 @@ export default function Dashboard() {
     ]
   };
 
+  // Prepare price chart data
+  const aapl = priceData.AAPL || [];
+  const msft = priceData.MSFT || [];
+  
+  const priceChartData = {
+    labels: aapl.map(p => new Date(p.timestamp).toLocaleDateString()),
+    datasets: [
+      {
+        label: "AAPL",
+        data: aapl.map(p => p.close),
+        borderColor: "#22c55e",
+        tension: 0.4,
+        fill: false
+      },
+      {
+        label: "MSFT",
+        data: msft.map(p => p.close),
+        borderColor: "#a78bfa",
+        tension: 0.4,
+        fill: false
+      }
+    ]
+  };
+
   const latestTrade = data[data.length - 1];
 
   return (
@@ -55,6 +94,13 @@ export default function Dashboard() {
         <CardContent>
           <h2 className="text-xl font-bold mb-4">Z-Score and Spread Over Time</h2>
           <Line data={chartData} />
+        </CardContent>
+      </Card>
+
+      <Card className="bg-gray-800">
+        <CardContent>
+          <h2 className="text-xl font-bold mb-4">Stock Prices</h2>
+          <Line data={priceChartData} />
         </CardContent>
       </Card>
 

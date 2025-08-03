@@ -1,9 +1,10 @@
 from celery import chain
-from flask import Flask, Response, json, jsonify
-from pymongo import MongoClient
+from flask import Flask, Response, json, jsonify, request
+from pymongo import MongoClient, DESCENDING
 from routes.pair_routes import pair_bp
 from celery_worker.tasks import fetch_and_store_prices  # ✅ Import the task
 from flask_cors import CORS
+from datetime import datetime
 
 
 
@@ -54,5 +55,43 @@ def trade_history():
         }
 
     return jsonify([serialize_trade(t) for t in trades])
+
+@app.route("/prices", methods=["GET"])
+def prices():
+    # /prices?symbols=AAPL,MSFT&limit=300
+    symbols = request.args.get("symbols", "AAPL,MSFT").split(",")
+    symbols = [s.strip().upper() for s in symbols if s.strip()]
+    limit = int(request.args.get("limit", 300))
+
+    out = {}
+    for sym in symbols:
+        # latest N by Date, then reverse to ascending
+        docs = (
+            db.symbol_price_data
+              .find({"symbol": sym})
+              .sort("Date", DESCENDING)
+              .limit(limit)
+        )
+        series = []
+        for d in docs:
+            # Try common field names
+            close = (
+                d.get("Close")
+                or d.get(f"{sym}_Close")
+                or d.get("close")
+                or d.get("Adj Close")
+            )
+            # Convert date
+            dt = d.get("Date")
+            if isinstance(dt, datetime):
+                ts = dt.isoformat()
+            else:
+                # handle string date
+                ts = str(dt)
+            if close is not None:
+                series.append({"timestamp": ts, "close": float(close)})
+        out[sym] = list(reversed(series))
+    return jsonify(out)
+
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0")
