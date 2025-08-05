@@ -123,59 +123,113 @@ def align_and_extract_close_prices(_):
 
 
 @app.task
-def calculate_spread_and_zscore(_=None):
+def calculate_spread_and_zscore(prev = None, window: int = 30, _=None):
+    """
+    Recompute z-scores for the entire history (rolling window) and upsert into
+    trading_db.spread_data. This backfills any missing days and also provides
+    the most recent record as the task result.
+    """
     client = MongoClient("mongodb://mongo:27017")
     db = client["trading_db"]
 
+    # --- Load price data ---
     aapl_docs = list(db.symbol_price_data.find({"symbol": "AAPL"}))
     msft_docs = list(db.symbol_price_data.find({"symbol": "MSFT"}))
 
     if not aapl_docs or not msft_docs:
-        print("Missing price data")
+        print("[zscore] Missing price data (AAPL/MSFT).")
         return {"error": "Missing price data"}
 
     aapl_df = pd.DataFrame(aapl_docs)
     msft_df = pd.DataFrame(msft_docs)
-    aapl_df["Date"] = pd.to_datetime(aapl_df["Date"])
-    msft_df["Date"] = pd.to_datetime(msft_df["Date"])
 
+    # Defensive column handling (supports either "<SYM>_Close" or "Close")
+    def normalize_close(df, sym):
+        df = df.copy()
+        df["Date"] = pd.to_datetime(df["Date"])
+        close_col = f"{sym}_Close"
+        if close_col in df.columns:
+            out = df[["Date", close_col]].rename(columns={close_col: "Close"})
+        elif "Close" in df.columns:
+            out = df[["Date", "Close"]]
+        else:
+            # try best-effort find a Close-like column
+            guess = df.filter(like="Close").columns
+            if len(guess) == 0:
+                raise ValueError(f"[zscore] No close column found for {sym}")
+            out = df[["Date", guess[0]]].rename(columns={guess[0]: "Close"})
+        out = out.sort_values("Date")
+        out["Symbol"] = sym
+        return out
+
+    a = normalize_close(aapl_df, "AAPL")  # Date, Close
+    m = normalize_close(msft_df, "MSFT")  # Date, Close
+
+    # --- Merge & compute spread and rolling stats ---
     merged = pd.merge(
-        aapl_df[["Date", "AAPL_Close"]],
-        msft_df[["Date", "MSFT_Close"]],
+        a.rename(columns={"Close": "AAPL_Close"}),
+        m.rename(columns={"Close": "MSFT_Close"}),
         on="Date",
         how="inner"
-    ).sort_values("Date")
+    ).sort_values("Date").reset_index(drop=True)
 
-    merged["spread"] = merged["AAPL_Close"] - merged["MSFT_Close"]
-
-    if merged.shape[0] < 30:
-        print("Not enough data points for Z-score")
+    if merged.shape[0] < window:
+        print(f"[zscore] Not enough data points (have {merged.shape[0]}, need {window}).")
         return {"error": "Not enough data points for Z-score"}
 
-    recent_data = merged.iloc[-30:]
-    spread_series = recent_data["spread"]
-    mean = spread_series.mean()
-    std = spread_series.std()
+    merged["spread"] = merged["AAPL_Close"] - merged["MSFT_Close"]
+    merged["spread_mean"] = merged["spread"].rolling(window).mean()
+    merged["spread_std"] = merged["spread"].rolling(window).std()
+    merged["z_score"] = (merged["spread"] - merged["spread_mean"]) / merged["spread_std"]
 
-    if std == 0:
-        print("Standard deviation is zero, skipping Z-score calculation")
-        return {"error": "Standard deviation is zero"}
+    # Drop the initial NaNs before the rolling window is filled
+    merged = merged.dropna(subset=["z_score"]).copy()
+    if merged.empty:
+        print("[zscore] No rows after rolling window; aborting.")
+        return {"error": "No z-scores computed"}
 
-    z_score = (spread_series.iloc[-1] - mean) / std
+    # --- Ensure index for idempotent upserts ---
+    try:
+        db.spread_data.create_index("timestamp", unique=True)
+    except Exception as e:
+        print(f"[zscore] Index creation warning: {e}")
 
-    record = {
-        "timestamp": datetime.now(timezone.utc),
-        "aapl_price": recent_data["AAPL_Close"].iloc[-1],
-        "msft_price": recent_data["MSFT_Close"].iloc[-1],
-        "spread": spread_series.iloc[-1],
-        "z_score": z_score,
+    # --- Upsert all rows (backfill + keep current updated) ---
+    upserts = 0
+    for _, r in merged.iterrows():
+        # Use the candle's date as the timestamp (UTC midnight)
+        ts = pd.Timestamp(r["Date"]).to_pydatetime().replace(tzinfo=timezone.utc)
+        doc = {
+            "timestamp": ts,
+            "aapl_price": float(r["AAPL_Close"]),
+            "msft_price": float(r["MSFT_Close"]),
+            "spread": float(r["spread"]),
+            "z_score": float(r["z_score"]),
+        }
+        res = db.spread_data.update_one(
+            {"timestamp": ts},
+            {"$set": doc},
+            upsert=True
+        )
+        # Count only effective writes
+        if res.upserted_id is not None or res.modified_count > 0:
+            upserts += 1
+
+    latest = merged.iloc[-1]
+    latest_ts = pd.Timestamp(latest["Date"]).to_pydatetime().replace(tzinfo=timezone.utc)
+    latest_record = {
+        "timestamp": latest_ts,
+        "aapl_price": float(latest["AAPL_Close"]),
+        "msft_price": float(latest["MSFT_Close"]),
+        "spread": float(latest["spread"]),
+        "z_score": float(latest["z_score"]),
+        "upserts": upserts
     }
 
-    insert_result = db.spread_data.insert_one(record)
-    record["_id"] = str(insert_result.inserted_id)  # Convert ObjectId to string
+    print(f"[zscore] Upserted {upserts} rows. Latest: {latest_record}")
+    # Return a JSON-serializable dict (no ObjectId)
+    return latest_record
 
-    print(f"Inserted spread record: {record}")
-    return record
 
 @app.task
 def evaluate_and_place_trade(_=None):
