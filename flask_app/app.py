@@ -56,6 +56,26 @@ def trade_history():
 
     return jsonify([serialize_trade(t) for t in trades])
 
+@app.route("/stock-zscores", methods=["GET"])
+def stock_zscores():
+    client = MongoClient("mongodb://mongo:27017")
+    db = client["trading_db"]
+    
+    # Fetch all z-score data from spread_data collection, sorted by timestamp
+    zscores = db.spread_data.find().sort("timestamp", 1)
+
+    def serialize_stock_zscore(doc):
+        return {
+            "id": str(doc["_id"]),
+            "timestamp": doc["timestamp"].isoformat(),
+            "z_score": doc.get("z_score", None),
+            "spread": doc.get("spread", None),
+            "aapl_price": doc.get("aapl_price", None),
+            "msft_price": doc.get("msft_price", None),
+        }
+
+    return jsonify([serialize_stock_zscore(z) for z in zscores])
+
 @app.route("/prices", methods=["GET"])
 def prices():
     # /prices?symbols=AAPL,MSFT&limit=300
