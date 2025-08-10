@@ -298,9 +298,21 @@ def evaluate_and_place_trade(_=None):
             else:
                 pnl = (msft_price - open_trade["msft_price"]) - (aapl_price - open_trade["aapl_price"])
 
-            db.trades.update_one({"_id": open_trade["_id"]}, {"$set": {"status": "closed"}})
+            # Update the original trade with PnL and closed status
+            db.trades.update_one(
+                {"_id": open_trade["_id"]}, 
+                {"$set": {
+                    "status": "closed",
+                    "pnl": pnl,
+                    "close_timestamp": timestamp,
+                    "close_aapl_price": aapl_price,
+                    "close_msft_price": msft_price,
+                    "close_z_score": z_score
+                }}
+            )
 
-            new_trade = {
+            # Also create a close record for tracking
+            close_record = {
                 "timestamp": timestamp,
                 "action": "close",
                 "aapl_price": aapl_price,
@@ -309,9 +321,10 @@ def evaluate_and_place_trade(_=None):
                 "z_score": z_score,
                 "status": "closed",
                 "entry_trade_id": open_trade["_id"],
-                "pnl": pnl
+                "pnl": pnl,
+                "trade_type": "close_record"
             }
-            db.trades.insert_one(new_trade)
+            db.trades.insert_one(close_record)
             print(f"🔴 [Trade Closed] Closed trade from {open_trade['timestamp']} | PnL: {pnl:.2f}")
         else:
             print(f"ℹ️ [Trade Eval] Z-score has not reverted enough to close. Current: {z_score}")

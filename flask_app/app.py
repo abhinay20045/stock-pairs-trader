@@ -6,9 +6,6 @@ from celery_worker.tasks import fetch_and_store_prices  # ✅ Import the task
 from flask_cors import CORS
 from datetime import datetime
 
-
-
-
 app = Flask(__name__)
 app.register_blueprint(pair_bp)
 
@@ -113,5 +110,105 @@ def prices():
         out[sym] = list(reversed(series))
     return jsonify(out)
 
+@app.route("/pnl-history", methods=["GET"])
+def pnl_history():
+    """
+    Returns a time series of cumulative PnL.
+    - Realized PnL increases whenever a 'closed' trade doc appears (uses its stored 'pnl')
+    - If there is an open trade, append a final point with realized + unrealized PnL at 'now'
+    """
+    # Get all trades sorted by timestamp
+    trades = list(db.trades.find().sort("timestamp", 1))
+    
+    if not trades:
+        return jsonify([])
+
+    points = []
+    cum_realized = 0.0
+    last_timestamp = None
+
+    # Process all trades to build PnL history
+    for t in trades:
+        ts = t.get("timestamp")
+        status = t.get("status")
+        action = t.get("action")
+        
+        # Skip trade entries that don't have proper data
+        if not ts or not status or not action:
+            continue
+            
+        # For closed trades, use the stored PnL
+        if status == "closed" and "pnl" in t and t["pnl"] is not None:
+            cum_realized += float(t["pnl"])
+            points.append({
+                "timestamp": ts.isoformat(),
+                "cumulative_pnl": cum_realized,
+                "type": "realized",
+                "trade_id": str(t["_id"]),
+                "pnl": float(t["pnl"])
+            })
+            last_timestamp = ts
+
+    # Add unrealized PnL if there's an open trade
+    open_trade = db.trades.find_one({"status": "open"}, sort=[("timestamp", -1)])
+    if open_trade and last_timestamp:
+        # Get latest price data
+        latest = db.spread_data.find_one(sort=[("timestamp", -1)])
+        if latest and "aapl_price" in latest and "msft_price" in latest:
+            a_now = float(latest["aapl_price"])
+            m_now = float(latest["msft_price"])
+            
+            # Calculate unrealized PnL based on current prices vs entry prices
+            if open_trade["action"] == "long_aapl_short_msft":
+                unreal = (a_now - float(open_trade["aapl_price"])) - (m_now - float(open_trade["msft_price"]))
+            else:  # short_aapl_long_msft
+                unreal = (m_now - float(open_trade["msft_price"])) - (a_now - float(open_trade["aapl_price"]))
+            
+            points.append({
+                "timestamp": latest["timestamp"].isoformat(),
+                "cumulative_pnl": cum_realized + unreal,
+                "type": "unrealized",
+                "trade_id": str(open_trade["_id"]),
+                "unrealized_pnl": unreal
+            })
+
+    return jsonify(points)
+
+@app.route("/trades/debug", methods=["GET"])
+def debug_trades():
+    """
+    Debug endpoint to see all trades and their current status
+    """
+    trades = list(db.trades.find().sort("timestamp", -1))
+    
+    debug_info = []
+    for t in trades:
+        debug_info.append({
+            "id": str(t["_id"]),
+            "timestamp": t["timestamp"].isoformat() if t.get("timestamp") else None,
+            "action": t.get("action"),
+            "status": t.get("status"),
+            "aapl_price": t.get("aapl_price"),
+            "msft_price": t.get("msft_price"),
+            "pnl": t.get("pnl"),
+            "z_score": t.get("z_score"),
+            "spread": t.get("spread")
+        })
+    
+    return jsonify({
+        "total_trades": len(debug_info),
+        "open_trades": len([t for t in debug_info if t["status"] == "open"]),
+        "closed_trades": len([t for t in debug_info if t["status"] == "closed"]),
+        "trades": debug_info
+    })
+
+@app.route("/trades/reset", methods=["POST"])
+def reset_trades():
+    """
+    Reset all trades (for testing purposes)
+    """
+    db.trades.delete_many({})
+    return jsonify({"message": "All trades reset"})
+    
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0")
