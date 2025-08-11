@@ -255,24 +255,61 @@ def evaluate_and_place_trade(_=None):
 
     print(f"📊 [Trade Eval] Latest Data — Z-score: {z_score}, AAPL: {aapl_price}, MSFT: {msft_price}, Spread: {spread}, Time: {timestamp}")
 
-    # Check for open trade
-    open_trade = db.trades.find_one({"status": "open"}, sort=[("timestamp", -1)])
-
-    if open_trade:
-        print(f"🟡 [Trade Eval] Found open trade: {open_trade['action']} from {open_trade['timestamp']}")
+    # Check for existing open trades of the same type
+    if z_score > .1:
+        trade_action = "short_aapl_long_msft"
+        open_trades = list(db.trades.find({"status": "open", "action": trade_action}))
+    elif z_score < -.1:
+        trade_action = "long_aapl_short_msft"
+        open_trades = list(db.trades.find({"status": "open", "action": trade_action}))
     else:
-        print("✅ [Trade Eval] No open trades.")
+        trade_action = None
+        open_trades = []
 
-    trade_action = None
-    new_trade = {}
-
-    if not open_trade:
-        if z_score > 1.0:
-            trade_action = "short_aapl_long_msft"
-        elif z_score < -1.0:
-            trade_action = "long_aapl_short_msft"
-
-        if trade_action:
+    if trade_action:
+        print(f"🟡 [Trade Eval] Found {len(open_trades)} open trades of type: {trade_action}")
+        
+        # Check if we should close positions
+        should_close = (
+            (trade_action == "long_aapl_short_msft" and z_score >= 0) or
+            (trade_action == "short_aapl_long_msft" and z_score <= 0)
+        )
+        
+        if should_close and open_trades:
+            # Close all open trades of this type
+            total_pnl = 0.0
+            for trade in open_trades:
+                shares = trade.get("shares", 1)
+                if trade_action == "long_aapl_short_msft":
+                    pnl = (aapl_price - trade["aapl_price"]) - (msft_price - trade["msft_price"])
+                else:
+                    pnl = (msft_price - trade["msft_price"]) - (aapl_price - trade["aapl_price"])
+                
+                pnl *= shares
+                total_pnl += pnl
+                
+                # Update the trade with PnL and closed status
+                db.trades.update_one(
+                    {"_id": trade["_id"]}, 
+                    {"$set": {
+                        "status": "closed",
+                        "pnl": pnl,
+                        "close_timestamp": timestamp,
+                        "close_aapl_price": aapl_price,
+                        "close_msft_price": msft_price,
+                        "close_z_score": z_score,
+                        "shares": shares
+                    }}
+                )
+            
+            print(f"🔴 [Trade Closed] Closed {len(open_trades)} trades | Total PnL: {total_pnl:.2f}")
+            
+        elif not should_close:
+            # Add to existing position or create new one
+            if open_trades:
+                print(f"📈 [Trade Eval] Adding to existing position")
+            
+            # Create new trade entry
             new_trade = {
                 "timestamp": timestamp,
                 "action": trade_action,
@@ -280,56 +317,16 @@ def evaluate_and_place_trade(_=None):
                 "msft_price": msft_price,
                 "spread": spread,
                 "z_score": z_score,
-                "status": "open"
+                "status": "open",
+                "shares": 1
             }
             db.trades.insert_one(new_trade)
-            print(f"🟢 [Trade Placed] {trade_action} at Z-score: {z_score}")
-        else:
-            print("ℹ️ [Trade Eval] Z-score does not exceed entry threshold. No trade placed.")
+            print(f"🟢 [Trade Placed] {trade_action} at Z-score: {z_score} | Shares: 1")
+            
     else:
-        should_close = (
-            (open_trade["action"] == "long_aapl_short_msft" and z_score >= 0) or
-            (open_trade["action"] == "short_aapl_long_msft" and z_score <= 0)
-        )
+        print("ℹ️ [Trade Eval] Z-score does not exceed entry threshold. No trade placed.")
 
-        if should_close:
-            if open_trade["action"] == "long_aapl_short_msft":
-                pnl = (aapl_price - open_trade["aapl_price"]) - (msft_price - open_trade["msft_price"])
-            else:
-                pnl = (msft_price - open_trade["msft_price"]) - (aapl_price - open_trade["aapl_price"])
-
-            # Update the original trade with PnL and closed status
-            db.trades.update_one(
-                {"_id": open_trade["_id"]}, 
-                {"$set": {
-                    "status": "closed",
-                    "pnl": pnl,
-                    "close_timestamp": timestamp,
-                    "close_aapl_price": aapl_price,
-                    "close_msft_price": msft_price,
-                    "close_z_score": z_score
-                }}
-            )
-
-            # Also create a close record for tracking
-            close_record = {
-                "timestamp": timestamp,
-                "action": "close",
-                "aapl_price": aapl_price,
-                "msft_price": msft_price,
-                "spread": spread,
-                "z_score": z_score,
-                "status": "closed",
-                "entry_trade_id": open_trade["_id"],
-                "pnl": pnl,
-                "trade_type": "close_record"
-            }
-            db.trades.insert_one(close_record)
-            print(f"🔴 [Trade Closed] Closed trade from {open_trade['timestamp']} | PnL: {pnl:.2f}")
-        else:
-            print(f"ℹ️ [Trade Eval] Z-score has not reverted enough to close. Current: {z_score}")
-
-    return new_trade if new_trade else "No action taken."
+    return "Trade evaluation completed."
 
 
 

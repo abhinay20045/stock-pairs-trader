@@ -49,6 +49,7 @@ def trade_history():
             "z_score": trade.get("z_score", None),
             "pnl": trade.get("pnl", None),
             "status": trade.get("status", ""),
+            "shares": trade.get("shares", 1)
         }
 
     return jsonify([serialize_trade(t) for t in trades])
@@ -115,7 +116,8 @@ def pnl_history():
     """
     Returns a time series of cumulative PnL.
     - Realized PnL increases whenever a 'closed' trade doc appears (uses its stored 'pnl')
-    - If there is an open trade, append a final point with realized + unrealized PnL at 'now'
+    - If there are open trades, append a final point with realized + unrealized PnL at 'now'
+    - Handles multiple open trades with average costs
     """
     # Get all trades sorted by timestamp
     trades = list(db.trades.find().sort("timestamp", 1))
@@ -145,32 +147,66 @@ def pnl_history():
                 "cumulative_pnl": cum_realized,
                 "type": "realized",
                 "trade_id": str(t["_id"]),
-                "pnl": float(t["pnl"])
+                "pnl": float(t["pnl"]),
+                "shares": t.get("shares", 1)
             })
             last_timestamp = ts
 
-    # Add unrealized PnL if there's an open trade
-    open_trade = db.trades.find_one({"status": "open"}, sort=[("timestamp", -1)])
-    if open_trade and last_timestamp:
+    # Calculate unrealized PnL for all open trades
+    open_trades = list(db.trades.find({"status": "open"}))
+    if open_trades and last_timestamp:
         # Get latest price data
         latest = db.spread_data.find_one(sort=[("timestamp", -1)])
         if latest and "aapl_price" in latest and "msft_price" in latest:
             a_now = float(latest["aapl_price"])
             m_now = float(latest["msft_price"])
             
-            # Calculate unrealized PnL based on current prices vs entry prices
-            if open_trade["action"] == "long_aapl_short_msft":
-                unreal = (a_now - float(open_trade["aapl_price"])) - (m_now - float(open_trade["msft_price"]))
-            else:  # short_aapl_long_msft
-                unreal = (m_now - float(open_trade["msft_price"])) - (a_now - float(open_trade["aapl_price"]))
+            # Group open trades by action type
+            long_aapl_trades = [t for t in open_trades if t["action"] == "long_aapl_short_msft"]
+            short_aapl_trades = [t for t in open_trades if t["action"] == "short_aapl_long_msft"]
             
-            points.append({
-                "timestamp": latest["timestamp"].isoformat(),
-                "cumulative_pnl": cum_realized + unreal,
-                "type": "unrealized",
-                "trade_id": str(open_trade["_id"]),
-                "unrealized_pnl": unreal
-            })
+            total_unrealized = 0.0
+            total_open_shares = 0
+            
+            # Calculate unrealized PnL for long AAPL positions
+            if long_aapl_trades:
+                total_aapl_shares = sum(t.get("shares", 1) for t in long_aapl_trades)
+                total_aapl_cost = sum(t["aapl_price"] * t.get("shares", 1) for t in long_aapl_trades)
+                avg_aapl_entry = total_aapl_cost / total_aapl_shares
+                
+                total_msft_shares = sum(t.get("shares", 1) for t in long_aapl_trades)
+                total_msft_cost = sum(t["msft_price"] * t.get("shares", 1) for t in long_aapl_trades)
+                avg_msft_entry = total_msft_cost / total_msft_shares
+                
+                unreal = (a_now - avg_aapl_entry) - (m_now - avg_msft_entry)
+                unreal *= total_aapl_shares
+                total_unrealized += unreal
+                total_open_shares += total_aapl_shares
+            
+            # Calculate unrealized PnL for short AAPL positions
+            if short_aapl_trades:
+                total_aapl_shares = sum(t.get("shares", 1) for t in short_aapl_trades)
+                total_aapl_cost = sum(t["aapl_price"] * t.get("shares", 1) for t in short_aapl_trades)
+                avg_aapl_entry = total_aapl_cost / total_aapl_shares
+                
+                total_msft_shares = sum(t.get("shares", 1) for t in short_aapl_trades)
+                total_msft_cost = sum(t["msft_price"] * t.get("shares", 1) for t in short_aapl_trades)
+                avg_msft_entry = total_msft_cost / total_msft_shares
+                
+                unreal = (avg_msft_entry - m_now) - (avg_aapl_entry - a_now)
+                unreal *= total_aapl_shares
+                total_unrealized += unreal
+                total_open_shares += total_aapl_shares
+            
+            if total_open_shares > 0:
+                points.append({
+                    "timestamp": latest["timestamp"].isoformat(),
+                    "cumulative_pnl": cum_realized + total_unrealized,
+                    "type": "unrealized",
+                    "unrealized_pnl": total_unrealized,
+                    "total_open_shares": total_open_shares,
+                    "open_positions": len(open_trades)
+                })
 
     return jsonify(points)
 
@@ -192,13 +228,42 @@ def debug_trades():
             "msft_price": t.get("msft_price"),
             "pnl": t.get("pnl"),
             "z_score": t.get("z_score"),
-            "spread": t.get("spread")
+            "spread": t.get("spread"),
+            "shares": t.get("shares", 1)
         })
+    
+    # Group open trades by action type
+    open_trades = [t for t in debug_info if t["status"] == "open"]
+    long_aapl_positions = [t for t in open_trades if t["action"] == "long_aapl_short_msft"]
+    short_aapl_positions = [t for t in open_trades if t["action"] == "short_aapl_long_msft"]
+    
+    # Calculate position summaries
+    position_summary = {}
+    if long_aapl_positions:
+        total_shares = sum(t["shares"] for t in long_aapl_positions)
+        total_aapl_cost = sum(t["aapl_price"] * t["shares"] for t in long_aapl_positions)
+        avg_aapl_entry = total_aapl_cost / total_shares
+        position_summary["long_aapl_short_msft"] = {
+            "count": len(long_aapl_positions),
+            "total_shares": total_shares,
+            "avg_aapl_entry": round(avg_aapl_entry, 2)
+        }
+    
+    if short_aapl_positions:
+        total_shares = sum(t["shares"] for t in short_aapl_positions)
+        total_aapl_cost = sum(t["aapl_price"] * t["shares"] for t in short_aapl_positions)
+        avg_aapl_entry = total_aapl_cost / total_shares
+        position_summary["short_aapl_long_msft"] = {
+            "count": len(short_aapl_positions),
+            "total_shares": total_shares,
+            "avg_aapl_entry": round(avg_aapl_entry, 2)
+        }
     
     return jsonify({
         "total_trades": len(debug_info),
-        "open_trades": len([t for t in debug_info if t["status"] == "open"]),
+        "open_trades": len(open_trades),
         "closed_trades": len([t for t in debug_info if t["status"] == "closed"]),
+        "position_summary": position_summary,
         "trades": debug_info
     })
 
