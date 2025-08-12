@@ -13,6 +13,9 @@ def fetch_and_store_prices(stock1, stock2):
         client = MongoClient("mongodb://mongo:27017")
         db = client["trading_db"]
         today = datetime.now(timezone.utc)
+        
+        # Set lookback to 7 days maximum
+        max_lookback = today - timedelta(days=7)
 
         for symbol in [stock1, stock2]:
             # Step 1: Get the last stored date for this symbol
@@ -20,21 +23,31 @@ def fetch_and_store_prices(stock1, stock2):
                 {"symbol": symbol},
                 sort=[("Date", -1)]
             )
+            
             if latest_doc:
                 last_date = latest_doc["Date"]
                 if isinstance(last_date, datetime):
-                    start_datetime = (last_date + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+                    # Start from the last stored date + 1 minute
+                    start_datetime = last_date + timedelta(minutes=1)
                 else:
-                    start_datetime = datetime.combine(last_date + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+                    # Handle string date - start from 7 days ago
+                    start_datetime = max_lookback
             else:
-                start_datetime = datetime(2022, 1, 1, tzinfo=timezone.utc)
+                # No existing data, start from 7 days ago
+                start_datetime = max_lookback
+
+            # Ensure we don't go beyond 7 days
+            if start_datetime < max_lookback:
+                start_datetime = max_lookback
 
             if start_datetime >= today:
                 print(f"No new data to fetch for {symbol}. Latest date: {start_datetime}")
                 continue
 
             print(f"Fetching {symbol} data from {start_datetime} to {today}")
-            data = yf.download(symbol, start=start_datetime, end=today, auto_adjust=False)
+            
+            # Use interval='1m' for 1-minute data
+            data = yf.download(symbol, start=start_datetime, end=today, interval='1m', auto_adjust=False)
 
             if data.empty:
                 print(f"No new data for {symbol}")
@@ -60,8 +73,14 @@ def fetch_and_store_prices(stock1, stock2):
                     row_date_dt = row_date if row_date.tzinfo else row_date.replace(tzinfo=timezone.utc)
                 else:
                     row_date_dt = datetime.combine(row_date, datetime.min.time(), tzinfo=timezone.utc)
+                
+                # Skip if beyond our 7-day limit
+                if row_date_dt < max_lookback:
+                    continue
+                    
                 if row_date_dt >= today:
                     continue  # Skip today to avoid incomplete records
+                    
                 db.symbol_price_data.update_one(
                     {"symbol": symbol, "Date": row["Date"]},
                     {"$set": row},
@@ -74,7 +93,6 @@ def fetch_and_store_prices(stock1, stock2):
     except Exception as e:
         print(f"Error in fetch_and_store_prices: {e}")
         return f"Error: {e}"
-
 
 @app.task
 def align_and_extract_close_prices(_):
@@ -121,13 +139,14 @@ def align_and_extract_close_prices(_):
         "MSFT_prices": MSFT_prices.tolist()
     }
 
-
 @app.task
-def calculate_spread_and_zscore(prev = None, window: int = 30, _=None):
+def calculate_spread_and_zscore(prev = None, window: int = 1440, _=None):
     """
     Recompute z-scores for the entire history (rolling window) and upsert into
-    trading_db.spread_data. This backfills any missing days and also provides
+    trading_db.spread_data. This backfills any missing data and also provides
     the most recent record as the task result.
+    
+    With 1-minute data, we use a 1440-minute (24-hour) rolling window by default
     """
     client = MongoClient("mongodb://mongo:27017")
     db = client["trading_db"]
@@ -197,7 +216,7 @@ def calculate_spread_and_zscore(prev = None, window: int = 30, _=None):
     # --- Upsert all rows (backfill + keep current updated) ---
     upserts = 0
     for _, r in merged.iterrows():
-        # Use the candle's date as the timestamp (UTC midnight)
+        # Use the candle's date as the timestamp
         ts = pd.Timestamp(r["Date"]).to_pydatetime().replace(tzinfo=timezone.utc)
         doc = {
             "timestamp": ts,
@@ -230,6 +249,42 @@ def calculate_spread_and_zscore(prev = None, window: int = 30, _=None):
     # Return a JSON-serializable dict (no ObjectId)
     return latest_record
 
+
+@app.task
+def cleanup_old_data():
+    """
+    Clean up old price data beyond 7 days to keep database efficient
+    """
+    client = MongoClient("mongodb://mongo:27017")
+    db = client["trading_db"]
+    
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=7)
+    
+    # Clean up old symbol price data
+    aapl_deleted = db.symbol_price_data.delete_many({
+        "symbol": "AAPL",
+        "Date": {"$lt": cutoff_date}
+    })
+    
+    msft_deleted = db.symbol_price_data.delete_many({
+        "symbol": "MSFT", 
+        "Date": {"$lt": cutoff_date}
+    })
+    
+    # Clean up old spread data
+    spread_deleted = db.spread_data.delete_many({
+        "timestamp": {"$lt": cutoff_date}
+    })
+    
+    print(f"[cleanup] Deleted {aapl_deleted.deleted_count} old AAPL records")
+    print(f"[cleanup] Deleted {msft_deleted.deleted_count} old MSFT records") 
+    print(f"[cleanup] Deleted {spread_deleted.deleted_count} old spread records")
+    
+    return {
+        "aapl_deleted": aapl_deleted.deleted_count,
+        "msft_deleted": msft_deleted.deleted_count,
+        "spread_deleted": spread_deleted.deleted_count
+    }
 
 @app.task
 def evaluate_and_place_trade(_=None):
@@ -328,13 +383,14 @@ def evaluate_and_place_trade(_=None):
 
     return "Trade evaluation completed."
 
-
-
 @app.task
 def trigger_chain():
     result = chain(
         fetch_and_store_prices.s("AAPL", "MSFT"),
-        align_and_extract_close_prices.s(), calculate_spread_and_zscore.s(), evaluate_and_place_trade.s()
+        align_and_extract_close_prices.s(), 
+        calculate_spread_and_zscore.s(), 
+        evaluate_and_place_trade.s(),
+        cleanup_old_data.s()
     ).apply_async()
     return {"task_id": result.id, "status": "submitted for alignment and extraction"}
 
