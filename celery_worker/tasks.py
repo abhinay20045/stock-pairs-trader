@@ -251,7 +251,7 @@ def calculate_spread_and_zscore(prev = None, window: int = 1440, _=None):
 
 
 @app.task
-def cleanup_old_data():
+def cleanup_old_data(_=None):
     """
     Clean up old price data beyond 7 days to keep database efficient
     """
