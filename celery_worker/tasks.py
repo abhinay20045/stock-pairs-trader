@@ -1,397 +1,434 @@
-from celery import Celery, chain
-import yfinance as yf
-from pymongo import MongoClient
-import pandas as pd
+# celery_worker/tasks.py
+from __future__ import annotations
+import logging, math
+from dataclasses import dataclass
+from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 
-app = Celery("tasks", broker="redis://redis:6379/0")
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from celery import Celery, chain
+from pymongo import MongoClient, UpdateOne, ASCENDING
 
-@app.task
-def fetch_and_store_prices(stock1, stock2):
-    print(f"Fetching prices for {stock1} and {stock2}")
-    try:
-        client = MongoClient("mongodb://mongo:27017")
-        db = client["trading_db"]
-        today = datetime.now(timezone.utc)
-        
-        # Set lookback to 7 days maximum
-        max_lookback = today - timedelta(days=7)
+# =========================
+# CONFIG (edit these 2 to switch behavior)
+# =========================
+MODEL_NAME    = "zscore"        # "zscore" or "eg_ci"
+STRATEGY_NAME = "zscore"        # "zscore" or "cointegration"
 
-        for symbol in [stock1, stock2]:
-            # Step 1: Get the last stored date for this symbol
-            latest_doc = db.symbol_price_data.find_one(
-                {"symbol": symbol},
-                sort=[("Date", -1)]
-            )
-            
-            if latest_doc:
-                last_date = latest_doc["Date"]
-                if isinstance(last_date, datetime):
-                    # Start from the last stored date + 1 minute
-                    start_datetime = last_date + timedelta(minutes=1)
-                else:
-                    # Handle string date - start from 7 days ago
-                    start_datetime = max_lookback
-            else:
-                # No existing data, start from 7 days ago
-                start_datetime = max_lookback
+# Symbols / infra
+SYMBOL_A = "AAPL"; SYMBOL_B = "MSFT"
+SYMBOLS  = [SYMBOL_A, SYMBOL_B]
+MONGO_URL = "mongodb://mongo:27017"
+REDIS_URL = "redis://redis:6379/0"
+DB_NAME   = "trading_db"
 
-            # Ensure we don't go beyond 7 days
-            if start_datetime < max_lookback:
-                start_datetime = max_lookback
+# Data policy
+INTERVAL = "1m"
+LOOKBACK_DAYS = 7
+SKIP_TODAY_CANDLES = False
 
-            if start_datetime >= today:
-                print(f"No new data to fetch for {symbol}. Latest date: {start_datetime}")
-                continue
+# Z-score defaults
+ROLLING_WINDOW_MIN = 1440    # ~1 day of minutes
+ENTRY_Z = 1.0
+EXIT_Z  = 0.0
 
-            print(f"Fetching {symbol} data from {start_datetime} to {today}")
-            
-            # Use interval='1m' for 1-minute data
-            data = yf.download(symbol, start=start_datetime, end=today, interval='1m', auto_adjust=False)
+# Cointegration defaults
+EG_WINDOW_MIN = 1440         # rolling window for OLS hedge ratio & residuals
+ADF_PVAL_MAX  = 0.10         # consider cointegrated if p<=0.10
+RESID_ENTRY_Z = 1.0
+RESID_EXIT_Z  = 0.0
 
-            if data.empty:
-                print(f"No new data for {symbol}")
-                continue
+SCALE_IN = True
+SHARES_PER_TRADE = 1
+CLEANUP_ON_CYCLE = True
 
-            data = data.reset_index()
-            data.columns = [
-                "Date",
-                f"{symbol}_Open",
-                f"{symbol}_High",
-                f"{symbol}_Low",
-                f"{symbol}_Close",
-                f"{symbol}_Adj Close",
-                f"{symbol}_Volume"
-            ]
-            data["symbol"] = symbol
+# =========================
+# Boilerplate
+# =========================
+app = Celery("tasks", broker=REDIS_URL)
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("worker")
 
-            records = data.to_dict("records")
-            for row in records:
-                row_date = row["Date"]
-                # Ensure row_date is a datetime with tzinfo
-                if isinstance(row_date, datetime):
-                    row_date_dt = row_date if row_date.tzinfo else row_date.replace(tzinfo=timezone.utc)
-                else:
-                    row_date_dt = datetime.combine(row_date, datetime.min.time(), tzinfo=timezone.utc)
-                
-                # Skip if beyond our 7-day limit
-                if row_date_dt < max_lookback:
-                    continue
-                    
-                if row_date_dt >= today:
-                    continue  # Skip today to avoid incomplete records
-                    
-                db.symbol_price_data.update_one(
-                    {"symbol": symbol, "Date": row["Date"]},
-                    {"$set": row},
-                    upsert=True
-                )
+_mongo = MongoClient(MONGO_URL)
+_db = _mongo[DB_NAME]
+def db(): return _db
+_db.symbol_price_data.create_index([("symbol", ASCENDING), ("Date", ASCENDING)], unique=True)
+_db.spread_data.create_index([("timestamp", ASCENDING)], unique=True)
+_db.trades.create_index([("status", ASCENDING), ("timestamp", ASCENDING)])
 
-            print(f"Inserted {len(records)} records for {symbol} from {start_datetime} to {today}")
+def _now() -> datetime: return datetime.now(timezone.utc)
+def _max_lookback() -> datetime: return _now() - timedelta(days=LOOKBACK_DAYS)
+def _tz(dt: datetime) -> datetime: return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-        return f"Fetched and stored prices for {stock1} and {stock2}"
-    except Exception as e:
-        print(f"Error in fetch_and_store_prices: {e}")
-        return f"Error: {e}"
+def _normalize_close(df: pd.DataFrame, sym: str) -> pd.DataFrame:
+    df = df.copy(); df["Date"] = pd.to_datetime(df["Date"])
+    col = f"{sym}_Close" if f"{sym}_Close" in df.columns else ("Close" if "Close" in df.columns else None)
+    if not col:
+        guess = df.filter(like="Close").columns
+        if not len(guess): raise ValueError(f"no close for {sym}")
+        col = guess[0]
+    return df[["Date", col]].rename(columns={col: f"{sym}_Close"}).sort_values("Date").reset_index(drop=True)
 
-@app.task
-def align_and_extract_close_prices(_):
-    client = MongoClient("mongodb://mongo:27017")
-    db = client["trading_db"]
+def _merge_prices(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
+    return pd.merge(a, b, on="Date", how="inner").sort_values("Date").reset_index(drop=True)
 
-    aapl_docs = list(db.symbol_price_data.find({"symbol": "AAPL"}))
-    msft_docs = list(db.symbol_price_data.find({"symbol": "MSFT"}))
+# =========================
+# DATA FETCH
+# =========================
+def fetch_new_prices(symbols: List[str]) -> int:
+    database = db()
+    today = _now(); max_lb = _max_lookback()
+    total = 0
+    for symbol in symbols:
+        latest = database.symbol_price_data.find_one({"symbol": symbol}, sort=[("Date", -1)])
+        start_dt = max_lb
+        if latest and isinstance(latest.get("Date"), datetime):
+            start_dt = max(latest["Date"] + timedelta(minutes=1), max_lb)
+        if start_dt >= today:
+            continue
+        df = yf.download(symbol, start=start_dt, end=today, interval=INTERVAL, auto_adjust=False)
+        if df.empty: continue
+        df = df.reset_index()
+        df.columns = ["Date", f"{symbol}_Open", f"{symbol}_High", f"{symbol}_Low",
+                      f"{symbol}_Close", f"{symbol}_Adj Close", f"{symbol}_Volume"]
+        df["symbol"] = symbol
+        ops = []
+        for _, r in df.iterrows():
+            dt = r["Date"]; 
+            if not isinstance(dt, datetime): continue
+            dt = _tz(dt)
+            if dt < max_lb: continue
+            if SKIP_TODAY_CANDLES and dt.date()==today.date(): continue
+            d = r.to_dict(); d["Date"]=dt
+            ops.append(UpdateOne({"symbol": symbol, "Date": dt}, {"$set": d}, upsert=True))
+        if ops:
+            res = database.symbol_price_data.bulk_write(ops, ordered=False)
+            total += res.upserted_count + res.modified_count
+    return total
 
-    if not aapl_docs or not msft_docs:
-        print("AAPL or MSFT data not found in symbol_price_data.")
-        return None
-
-    aapl_df = pd.DataFrame(aapl_docs)
-    msft_df = pd.DataFrame(msft_docs)
-
-    if "Date" not in aapl_df.columns or "AAPL_Close" not in aapl_df.columns:
-        print("Missing columns in AAPL data.")
-        return None
-    if "Date" not in msft_df.columns or "MSFT_Close" not in msft_df.columns:
-        print("Missing columns in MSFT data.")
-        return None
-
-    aapl_df["Date"] = pd.to_datetime(aapl_df["Date"])
-    msft_df["Date"] = pd.to_datetime(msft_df["Date"])
-    aapl_df = aapl_df.sort_values("Date")
-    msft_df = msft_df.sort_values("Date")
-
-    merged = pd.merge(
-        aapl_df[["Date", "AAPL_Close"]],
-        msft_df[["Date", "MSFT_Close"]],
-        on="Date",
-        how="inner"
-    )
-
-    AAPL_prices = merged["AAPL_Close"].to_numpy()
-    MSFT_prices = merged["MSFT_Close"].to_numpy()
-    print("Sample AAPL:", AAPL_prices[:10])
-    print("Sample MSFT:", MSFT_prices[:10])
-
-    return {
-        "dates": merged["Date"].dt.strftime("%Y-%m-%d").tolist(),
-        "AAPL_prices": AAPL_prices.tolist(),
-        "MSFT_prices": MSFT_prices.tolist()
-    }
-
-@app.task
-def calculate_spread_and_zscore(prev = None, window: int = 1440, _=None):
+# =========================
+# MODEL INTERFACE
+# =========================
+class BaseModel:
     """
-    Recompute z-scores for the entire history (rolling window) and upsert into
-    trading_db.spread_data. This backfills any missing data and also provides
-    the most recent record as the task result.
-    
-    With 1-minute data, we use a 1440-minute (24-hour) rolling window by default
+    Converts price history -> per-timestamp metric document(s) stored in spread_data.
+    Must implement:
+      - backfill() : recompute whole history (windowed) and upsert docs
+      - latest()   : return last metric doc (dict) for strategy consumption
     """
-    client = MongoClient("mongodb://mongo:27017")
-    db = client["trading_db"]
+    metric_name: str = "z_score"  # primary metric key produced
+    def backfill(self) -> int: raise NotImplementedError
+    def latest(self) -> Optional[Dict[str, Any]]: raise NotImplementedError
 
-    # --- Load price data ---
-    aapl_docs = list(db.symbol_price_data.find({"symbol": "AAPL"}))
-    msft_docs = list(db.symbol_price_data.find({"symbol": "MSFT"}))
+# ---- Model #1: Z-score of spread (classic pairs) -----------------------------
+class ZScoreSpreadModel(BaseModel):
+    metric_name = "z_score"
 
-    if not aapl_docs or not msft_docs:
-        print("[zscore] Missing price data (AAPL/MSFT).")
-        return {"error": "Missing price data"}
+    def __init__(self, window: int = ROLLING_WINDOW_MIN):
+        self.window = window
 
-    aapl_df = pd.DataFrame(aapl_docs)
-    msft_df = pd.DataFrame(msft_docs)
-
-    # Defensive column handling (supports either "<SYM>_Close" or "Close")
-    def normalize_close(df, sym):
-        df = df.copy()
-        df["Date"] = pd.to_datetime(df["Date"])
-        close_col = f"{sym}_Close"
-        if close_col in df.columns:
-            out = df[["Date", close_col]].rename(columns={close_col: "Close"})
-        elif "Close" in df.columns:
-            out = df[["Date", "Close"]]
-        else:
-            # try best-effort find a Close-like column
-            guess = df.filter(like="Close").columns
-            if len(guess) == 0:
-                raise ValueError(f"[zscore] No close column found for {sym}")
-            out = df[["Date", guess[0]]].rename(columns={guess[0]: "Close"})
-        out = out.sort_values("Date")
-        out["Symbol"] = sym
-        return out
-
-    a = normalize_close(aapl_df, "AAPL")  # Date, Close
-    m = normalize_close(msft_df, "MSFT")  # Date, Close
-
-    # --- Merge & compute spread and rolling stats ---
-    merged = pd.merge(
-        a.rename(columns={"Close": "AAPL_Close"}),
-        m.rename(columns={"Close": "MSFT_Close"}),
-        on="Date",
-        how="inner"
-    ).sort_values("Date").reset_index(drop=True)
-
-    if merged.shape[0] < window:
-        print(f"[zscore] Not enough data points (have {merged.shape[0]}, need {window}).")
-        return {"error": "Not enough data points for Z-score"}
-
-    merged["spread"] = merged["AAPL_Close"] - merged["MSFT_Close"]
-    merged["spread_mean"] = merged["spread"].rolling(window).mean()
-    merged["spread_std"] = merged["spread"].rolling(window).std()
-    merged["z_score"] = (merged["spread"] - merged["spread_mean"]) / merged["spread_std"]
-
-    # Drop the initial NaNs before the rolling window is filled
-    merged = merged.dropna(subset=["z_score"]).copy()
-    if merged.empty:
-        print("[zscore] No rows after rolling window; aborting.")
-        return {"error": "No z-scores computed"}
-
-    # --- Ensure index for idempotent upserts ---
-    try:
-        db.spread_data.create_index("timestamp", unique=True)
-    except Exception as e:
-        print(f"[zscore] Index creation warning: {e}")
-
-    # --- Upsert all rows (backfill + keep current updated) ---
-    upserts = 0
-    for _, r in merged.iterrows():
-        # Use the candle's date as the timestamp
-        ts = pd.Timestamp(r["Date"]).to_pydatetime().replace(tzinfo=timezone.utc)
-        doc = {
-            "timestamp": ts,
-            "aapl_price": float(r["AAPL_Close"]),
-            "msft_price": float(r["MSFT_Close"]),
-            "spread": float(r["spread"]),
-            "z_score": float(r["z_score"]),
-        }
-        res = db.spread_data.update_one(
-            {"timestamp": ts},
-            {"$set": doc},
-            upsert=True
-        )
-        # Count only effective writes
-        if res.upserted_id is not None or res.modified_count > 0:
-            upserts += 1
-
-    latest = merged.iloc[-1]
-    latest_ts = pd.Timestamp(latest["Date"]).to_pydatetime().replace(tzinfo=timezone.utc)
-    latest_record = {
-        "timestamp": latest_ts,
-        "aapl_price": float(latest["AAPL_Close"]),
-        "msft_price": float(latest["MSFT_Close"]),
-        "spread": float(latest["spread"]),
-        "z_score": float(latest["z_score"]),
-        "upserts": upserts
-    }
-
-    print(f"[zscore] Upserted {upserts} rows. Latest: {latest_record}")
-    # Return a JSON-serializable dict (no ObjectId)
-    return latest_record
-
-
-@app.task
-def cleanup_old_data(_=None):
-    """
-    Clean up old price data beyond 7 days to keep database efficient
-    """
-    client = MongoClient("mongodb://mongo:27017")
-    db = client["trading_db"]
-    
-    cutoff_date = datetime.now(timezone.utc) - timedelta(days=7)
-    
-    # Clean up old symbol price data
-    aapl_deleted = db.symbol_price_data.delete_many({
-        "symbol": "AAPL",
-        "Date": {"$lt": cutoff_date}
-    })
-    
-    msft_deleted = db.symbol_price_data.delete_many({
-        "symbol": "MSFT", 
-        "Date": {"$lt": cutoff_date}
-    })
-    
-    # Clean up old spread data
-    spread_deleted = db.spread_data.delete_many({
-        "timestamp": {"$lt": cutoff_date}
-    })
-    
-    print(f"[cleanup] Deleted {aapl_deleted.deleted_count} old AAPL records")
-    print(f"[cleanup] Deleted {msft_deleted.deleted_count} old MSFT records") 
-    print(f"[cleanup] Deleted {spread_deleted.deleted_count} old spread records")
-    
-    return {
-        "aapl_deleted": aapl_deleted.deleted_count,
-        "msft_deleted": msft_deleted.deleted_count,
-        "spread_deleted": spread_deleted.deleted_count
-    }
-
-@app.task
-def evaluate_and_place_trade(_=None):
-    from pymongo import MongoClient
-    from bson.objectid import ObjectId
-
-    client = MongoClient("mongodb://mongo:27017")
-    db = client["trading_db"]
-
-    print("🔍 [Trade Eval] Starting trade evaluation...")
-
-    # Fetch latest z-score record
-    latest = db.spread_data.find_one(sort=[("timestamp", -1)])
-    if not latest:
-        print("⚠️ [Trade Eval] No z-score data found in spread_data.")
-        return None
-
-    z_score = latest["z_score"]
-    aapl_price = latest["aapl_price"]
-    msft_price = latest["msft_price"]
-    spread = latest["spread"]
-    timestamp = latest["timestamp"]
-
-    print(f"📊 [Trade Eval] Latest Data — Z-score: {z_score}, AAPL: {aapl_price}, MSFT: {msft_price}, Spread: {spread}, Time: {timestamp}")
-
-    # Check for existing open trades of the same type
-    if z_score > .1:
-        trade_action = "short_aapl_long_msft"
-        open_trades = list(db.trades.find({"status": "open", "action": trade_action}))
-    elif z_score < -.1:
-        trade_action = "long_aapl_short_msft"
-        open_trades = list(db.trades.find({"status": "open", "action": trade_action}))
-    else:
-        trade_action = None
-        open_trades = []
-
-    if trade_action:
-        print(f"🟡 [Trade Eval] Found {len(open_trades)} open trades of type: {trade_action}")
-        
-        # Check if we should close positions
-        should_close = (
-            (trade_action == "long_aapl_short_msft" and z_score >= 0) or
-            (trade_action == "short_aapl_long_msft" and z_score <= 0)
-        )
-        
-        if should_close and open_trades:
-            # Close all open trades of this type
-            total_pnl = 0.0
-            for trade in open_trades:
-                shares = trade.get("shares", 1)
-                if trade_action == "long_aapl_short_msft":
-                    pnl = (aapl_price - trade["aapl_price"]) - (msft_price - trade["msft_price"])
-                else:
-                    pnl = (msft_price - trade["msft_price"]) - (aapl_price - trade["aapl_price"])
-                
-                pnl *= shares
-                total_pnl += pnl
-                
-                # Update the trade with PnL and closed status
-                db.trades.update_one(
-                    {"_id": trade["_id"]}, 
-                    {"$set": {
-                        "status": "closed",
-                        "pnl": pnl,
-                        "close_timestamp": timestamp,
-                        "close_aapl_price": aapl_price,
-                        "close_msft_price": msft_price,
-                        "close_z_score": z_score,
-                        "shares": shares
-                    }}
-                )
-            
-            print(f"🔴 [Trade Closed] Closed {len(open_trades)} trades | Total PnL: {total_pnl:.2f}")
-            
-        elif not should_close:
-            # Add to existing position or create new one
-            if open_trades:
-                print(f"📈 [Trade Eval] Adding to existing position")
-            
-            # Create new trade entry
-            new_trade = {
-                "timestamp": timestamp,
-                "action": trade_action,
-                "aapl_price": aapl_price,
-                "msft_price": msft_price,
-                "spread": spread,
-                "z_score": z_score,
-                "status": "open",
-                "shares": 1
+    def backfill(self) -> int:
+        database = db()
+        a = list(database.symbol_price_data.find({"symbol": SYMBOL_A}))
+        b = list(database.symbol_price_data.find({"symbol": SYMBOL_B}))
+        if not a or not b: return 0
+        adf = _normalize_close(pd.DataFrame(a), SYMBOL_A)
+        bdf = _normalize_close(pd.DataFrame(b), SYMBOL_B)
+        merged = _merge_prices(adf, bdf)
+        if len(merged) < self.window: return 0
+        z = merged.copy()
+        z["spread"] = z[f"{SYMBOL_A}_Close"] - z[f"{SYMBOL_B}_Close"]
+        z["mean"]   = z["spread"].rolling(self.window).mean()
+        z["std"]    = z["spread"].rolling(self.window).std()
+        z["z_score"]= (z["spread"] - z["mean"]) / z["std"]
+        z = z.dropna(subset=["z_score"])
+        ops = []
+        for _, r in z.iterrows():
+            ts = _tz(pd.Timestamp(r["Date"]).to_pydatetime())
+            doc = {
+                "timestamp": ts,
+                "aapl_price": float(r[f"{SYMBOL_A}_Close"]),
+                "msft_price": float(r[f"{SYMBOL_B}_Close"]),
+                "spread": float(r["spread"]),
+                "z_score": float(r["z_score"]),
+                "model": "zscore",
             }
-            db.trades.insert_one(new_trade)
-            print(f"🟢 [Trade Placed] {trade_action} at Z-score: {z_score} | Shares: 1")
-            
-    else:
-        print("ℹ️ [Trade Eval] Z-score does not exceed entry threshold. No trade placed.")
+            ops.append(UpdateOne({"timestamp": ts}, {"$set": doc}, upsert=True))
+        if ops:
+            res = database.spread_data.bulk_write(ops, ordered=False)
+            return res.upserted_count + res.modified_count
+        return 0
 
-    return "Trade evaluation completed."
+    def latest(self) -> Optional[Dict[str, Any]]:
+        return db().spread_data.find_one(sort=[("timestamp", -1)])
+
+# ---- Model #2: Engle–Granger cointegration (rolling) ------------------------
+# - rolling OLS: A_t ~ beta * B_t (+ intercept off for “hedge ratio” style)
+# - residuals r_t = A_t - beta*B_t
+# - standardize residuals over the same window -> resid_z
+# - (Optional) run a simple ADF on residuals; here we compute a quick p-value proxy
+#   to avoid heavy deps; if you already have statsmodels, you can plug in ADF directly.
+class EngleGrangerModel(BaseModel):
+    metric_name = "resid_z"
+
+    def __init__(self, window: int = EG_WINDOW_MIN, adf_pval_max: float = ADF_PVAL_MAX):
+        self.window = window
+        self.adf_pval_max = adf_pval_max
+
+    @staticmethod
+    def _rolling_beta(a: np.ndarray, b: np.ndarray, w: int) -> np.ndarray:
+        # beta_t = cov(a,b)/var(b) over rolling window
+        beta = np.full_like(a, np.nan, dtype=float)
+        for i in range(w-1, len(a)):
+            bseg = b[i-w+1:i+1]; aseg = a[i-w+1:i+1]
+            vb = np.var(bseg, ddof=1)
+            if vb == 0: 
+                beta[i] = np.nan
+            else:
+                beta[i] = np.cov(aseg, bseg, ddof=1)[0,1] / vb
+        return beta
+
+    @staticmethod
+    def _adf_proxy_pvalue(series: np.ndarray) -> float:
+        # A tiny heuristic proxy (NOT a real ADF): larger |rho-1| => smaller p
+        # You can drop-in statsmodels.tsa.stattools.adfuller for real ADF if available.
+        if len(series) < 5: return 1.0
+        x = np.asarray(series, float)
+        x = x - np.nanmean(x)
+        x1, x2 = x[:-1], x[1:]
+        denom = np.sum(x1*x1)
+        if denom == 0: return 1.0
+        rho = np.sum(x1*x2) / denom
+        # map rho in (0.8..1.05) -> p in (0.2..1.0) roughly
+        p = min(1.0, max(0.0, (rho - 0.8) / (1.05 - 0.8)))
+        return p
+
+    def backfill(self) -> int:
+        database = db()
+        a = list(database.symbol_price_data.find({"symbol": SYMBOL_A}))
+        b = list(database.symbol_price_data.find({"symbol": SYMBOL_B}))
+        if not a or not b: return 0
+        adf = _normalize_close(pd.DataFrame(a), SYMBOL_A)
+        bdf = _normalize_close(pd.DataFrame(b), SYMBOL_B)
+        merged = _merge_prices(adf, bdf)
+        if len(merged) < self.window: return 0
+
+        A = merged[f"{SYMBOL_A}_Close"].to_numpy(float)
+        B = merged[f"{SYMBOL_B}_Close"].to_numpy(float)
+
+        beta = self._rolling_beta(A, B, self.window)
+        resid = A - beta * B
+        # standardize residuals (rolling)
+        resid_s = pd.Series(resid).rolling(self.window)
+        resid_mu = resid_s.mean().to_numpy()
+        resid_sd = resid_s.std().to_numpy()
+        resid_z = (resid - resid_mu) / resid_sd
+
+        ops = []
+        for i in range(len(merged)):
+            if not math.isfinite(resid_z[i]): 
+                continue
+            ts = _tz(pd.Timestamp(merged["Date"].iloc[i]).to_pydatetime())
+            pval = self._adf_proxy_pvalue(resid[max(0, i-self.window+1):i+1])
+            doc = {
+                "timestamp": ts,
+                "aapl_price": float(A[i]),
+                "msft_price": float(B[i]),
+                "hedge_beta": float(beta[i]) if math.isfinite(beta[i]) else None,
+                "resid": float(resid[i]),
+                "resid_z": float(resid_z[i]),
+                "adf_pval": float(pval),
+                "model": "eg_ci",
+            }
+            ops.append(UpdateOne({"timestamp": ts}, {"$set": doc}, upsert=True))
+        if ops:
+            res = database.spread_data.bulk_write(ops, ordered=False)
+            return res.upserted_count + res.modified_count
+        return 0
+
+    def latest(self) -> Optional[Dict[str, Any]]:
+        return db().spread_data.find_one(sort=[("timestamp", -1)])
+
+# Model registry
+MODEL_REGISTRY: Dict[str, BaseModel] = {
+    "zscore": ZScoreSpreadModel(ROLLING_WINDOW_MIN),
+    "eg_ci":  EngleGrangerModel(EG_WINDOW_MIN, ADF_PVAL_MAX),
+}
+
+def get_model(name: str) -> BaseModel:
+    m = MODEL_REGISTRY.get(name)
+    if m is None: raise ValueError(f"unknown model: {name}")
+    return m
+
+# =========================
+# STRATEGY INTERFACE
+# =========================
+@dataclass
+class BaseStrategy:
+    def action(self, metric_doc: Dict[str, Any]) -> Tuple[Optional[str], bool]:
+        """
+        Return (entry_side, should_try_close_existing) where entry_side is:
+          'short_aapl_long_msft' | 'long_aapl_short_msft' | None
+        """
+        raise NotImplementedError
+
+    def allow_scale_in(self) -> bool: return True
+    def shares(self) -> int: return SHARES_PER_TRADE
+
+# Z-score strategy (original)
+@dataclass
+class PairsZScoreStrategy(BaseStrategy):
+    entry_z: float = ENTRY_Z
+    exit_z: float  = EXIT_Z
+    scale_in_flag: bool = SCALE_IN
+
+    def action(self, d: Dict[str, Any]) -> Tuple[Optional[str], bool]:
+        z = d.get("z_score")
+        if z is None: return (None, True)
+        if z > self.entry_z:  return ("short_aapl_long_msft", True)
+        if z < -self.entry_z: return ("long_aapl_short_msft", True)
+        # no new entry – but consider closing if reverted
+        return (None, True)
+
+    def allow_scale_in(self) -> bool: return self.scale_in_flag
+
+# Cointegration strategy
+@dataclass
+class PairsCointegrationStrategy(BaseStrategy):
+    adf_pval_max: float = ADF_PVAL_MAX
+    entry_z: float = RESID_ENTRY_Z
+    exit_z:  float = RESID_EXIT_Z
+    scale_in_flag: bool = SCALE_IN
+
+    def action(self, d: Dict[str, Any]) -> Tuple[Optional[str], bool]:
+        p = d.get("adf_pval", 1.0)
+        rz = d.get("resid_z")
+        if rz is None: return (None, True)
+        # only trade when cointegration is “on”
+        if p <= self.adf_pval_max:
+            if rz > self.entry_z:  return ("short_aapl_long_msft", True)
+            if rz < -self.entry_z: return ("long_aapl_short_msft", True)
+        return (None, True)
+
+    def allow_scale_in(self) -> bool: return self.scale_in_flag
+
+STRATEGY_REGISTRY: Dict[str, BaseStrategy] = {
+    "zscore":       PairsZScoreStrategy(),
+    "cointegration":PairsCointegrationStrategy(),
+}
+
+def get_strategy(name: str) -> BaseStrategy:
+    s = STRATEGY_REGISTRY.get(name)
+    if s is None: raise ValueError(f"unknown strategy: {name}")
+    return s
+
+# =========================
+# TRADING PIPE
+# =========================
+def evaluate_and_trade(strategy: BaseStrategy, model: BaseModel) -> str:
+    database = db()
+    d = model.latest()
+    if not d: return "no metric"
+
+    a = d.get("aapl_price"); m = d.get("msft_price"); z_like = d.get("z_score", d.get("resid_z"))
+    t = d.get("timestamp");  spread = d.get("spread", d.get("resid"))
+    entry_side, should_try_close = strategy.action(d)
+
+    # Close logic (reversion thresholds)
+    if should_try_close:
+        for side in ("long_aapl_short_msft", "short_aapl_long_msft"):
+            opens = list(database.trades.find({"status":"open","action":side}))
+            if not opens: continue
+            if isinstance(strategy, PairsZScoreStrategy):
+                z = d.get("z_score", 0.0)
+                close = (side=="long_aapl_short_msft" and z>=strategy.exit_z) or (side=="short_aapl_long_msft" and z<=-strategy.exit_z)
+            else:
+                rz = d.get("resid_z", 0.0)
+                close = (side=="long_aapl_short_msft" and rz>=strategy.exit_z) or (side=="short_aapl_long_msft" and rz<=-strategy.exit_z)
+            if close and a is not None and m is not None:
+                _close_trades(database, opens, a, m, z_like, t)
+
+    if entry_side is None:
+        return "no entry"
+
+    # Scale-in control
+    same_side = database.trades.find_one({"status":"open","action":entry_side})
+    if same_side and not strategy.allow_scale_in():
+        return "open exists (no scale)"
+
+    database.trades.insert_one({
+        "timestamp": t,
+        "action": entry_side,
+        "aapl_price": a,
+        "msft_price": m,
+        "spread": spread,
+        "z_like": z_like,
+        "model": d.get("model"),
+        "status": "open",
+        "shares": strategy.shares()
+    })
+    return f"entered {entry_side}"
+
+def _close_trades(database, opens: List[Dict[str, Any]], a: float, m: float, z_like: float, t: datetime):
+    total = 0.0
+    for tr in opens:
+        sh = tr.get("shares", 1)
+        if tr["action"] == "long_aapl_short_msft":
+            pnl = (a - tr["aapl_price"]) - (m - tr["msft_price"])
+        else:
+            pnl = (m - tr["msft_price"]) - (a - tr["aapl_price"])
+        pnl *= sh; total += pnl
+        database.trades.update_one({"_id": tr["_id"]}, {"$set": {
+            "status":"closed","pnl":pnl,"close_timestamp":t,
+            "close_aapl_price":a,"close_msft_price":m,"close_z_like":z_like
+        }})
+    log.info("[close] count=%d pnl=%.2f", len(opens), total)
+
+# =========================
+# CLEANUP
+# =========================
+def cleanup(days: int = LOOKBACK_DAYS) -> Dict[str,int]:
+    database = db()
+    cutoff = _now() - timedelta(days=days)
+    a = database.symbol_price_data.delete_many({"symbol":SYMBOL_A,"Date":{"$lt":cutoff}}).deleted_count
+    b = database.symbol_price_data.delete_many({"symbol":SYMBOL_B,"Date":{"$lt":cutoff}}).deleted_count
+    s = database.spread_data.delete_many({"timestamp":{"$lt":cutoff}}).deleted_count
+    return {"aapl":a,"msft":b,"spread":s}
+
+# =========================
+# CELERY TASKS
+# =========================
+@app.task
+def fetch_and_store_prices_task(symbols: Optional[List[str]] = None):
+    n = fetch_new_prices(symbols or SYMBOLS)
+    return {"upserted": n}
 
 @app.task
-def trigger_chain():
-    result = chain(
-        fetch_and_store_prices.s("AAPL", "MSFT"),
-        align_and_extract_close_prices.s(), 
-        calculate_spread_and_zscore.s(), 
-        evaluate_and_place_trade.s(),
-        cleanup_old_data.s()
-    ).apply_async()
-    return {"task_id": result.id, "status": "submitted for alignment and extraction"}
+def model_backfill_task(model_name: str = MODEL_NAME):
+    model = get_model(model_name)
+    n = model.backfill()
+    return {"model": model_name, "upserted": n}
 
-app.config_from_object("celery_worker.celeryconfig")
+@app.task
+def evaluate_and_place_trade_task(model_name: str = MODEL_NAME, strategy_name: str = STRATEGY_NAME):
+    model = get_model(model_name); strat = get_strategy(strategy_name)
+    res = evaluate_and_trade(strat, model)
+    return {"model": model_name, "strategy": strategy_name, "result": res}
+
+@app.task
+def cleanup_old_data_task(days: int = LOOKBACK_DAYS):
+    return cleanup(days)
+
+@app.task
+def trigger_chain(model_name: str = MODEL_NAME, strategy_name: str = STRATEGY_NAME):
+    sig = chain(
+        fetch_and_store_prices_task.si(SYMBOLS),
+        model_backfill_task.si(model_name),
+        evaluate_and_place_trade_task.si(model_name, strategy_name),
+    )
+    if CLEANUP_ON_CYCLE:
+        sig = sig | cleanup_old_data_task.si(LOOKBACK_DAYS)
+    r = sig.apply_async()
+    return {"task_id": r.id, "model": model_name, "strategy": strategy_name}
