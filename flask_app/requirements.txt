@@ -4,3 +4,7 @@ celery
 redis
 yfinance
 flask_cors
+numpy
+pandas
+scipy
+statsmodels

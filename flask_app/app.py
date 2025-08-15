@@ -4,7 +4,7 @@ from celery import chain
 from flask import Flask, Response, json, jsonify, request
 from flask_cors import CORS
 from pymongo import MongoClient, DESCENDING
-from datetime import datetime
+from datetime import datetime, timezone
 
 # If you still need your blueprint, keep this:
 try:
@@ -27,8 +27,8 @@ if pair_bp:
     app.register_blueprint(pair_bp)
 
 client = MongoClient("mongodb://mongo:27017")
+client = MongoClient("mongodb://mongo:27017", tz_aware=True, tzinfo=timezone.utc)
 db = client["trading_db"]
-
 
 # ------------------------------
 # Basic health

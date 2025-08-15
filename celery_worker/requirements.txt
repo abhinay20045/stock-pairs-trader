@@ -5,3 +5,6 @@ pandas
 pytz
 Flask
 datetime
+numpy
+scipy
+statsmodels
