@@ -432,3 +432,19 @@ def trigger_chain(model_name: str = MODEL_NAME, strategy_name: str = STRATEGY_NA
         sig = sig | cleanup_old_data_task.si(LOOKBACK_DAYS)
     r = sig.apply_async()
     return {"task_id": r.id, "model": model_name, "strategy": strategy_name}
+
+
+# ===== CELERY BEAT SCHEDULE =====
+# Runs the whole pipeline every 60s:
+# 1) fetch_and_store_prices_task
+# 2) model_backfill_task
+# 3) evaluate_and_place_trade_task
+# 4) cleanup_old_data_task (if CLEANUP_ON_CYCLE is True)
+app.conf.timezone = "UTC"
+app.conf.beat_schedule = {
+    "pairs-cycle-every-60s": {
+        "task": "celery_worker.tasks.trigger_chain",
+        "schedule": 60.0,
+        # optional args: ()  # trigger_chain uses defaults
+    },
+}
