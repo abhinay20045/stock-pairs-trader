@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useCallback } from "react";
 import { Card, CardContent } from "./components/Card";
 import { Line } from "react-chartjs-2";
 import {
@@ -17,26 +17,30 @@ ChartJS.register(LineElement, CategoryScale, LinearScale, PointElement, Tooltip,
 const parseTS = (t) => new Date(t);
 const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
 
-// Aggregate an array of points [{timestamp, value}] into fixed bins (ms).
-// mode: "avg" (default) or "last" (step-like; good for cumulative PnL)
-function aggregateSeries(points, binMs, mode = "avg") {
+// Aggregate [{timestamp,value}] into fixed bins (ms).
+// mode: "avg" (default) or "last" (for cumulative series).
+// startAtMs aligns bins to a fixed start so charts don't jitter.
+function aggregateSeries(points, binMs, mode = "avg", startAtMs) {
   if (!points || points.length === 0) return [];
   const out = [];
   const sorted = [...points].sort((a, b) => parseTS(a.timestamp) - parseTS(b.timestamp));
-  let binStart = Math.floor(parseTS(sorted[0].timestamp).getTime() / binMs) * binMs;
+
+  let binStart =
+    startAtMs ?? Math.floor(parseTS(sorted[0].timestamp).getTime() / binMs) * binMs;
   let binEnd = binStart + binMs;
   let bucket = [];
 
   const flush = () => {
     if (!bucket.length) return;
-    const ts = new Date(binEnd - 1);
+    const ts = new Date(binEnd - 1).toISOString();
     const v = mode === "last" ? bucket[bucket.length - 1] : avg(bucket);
-    out.push({ timestamp: ts.toISOString(), value: v });
+    out.push({ timestamp: ts, value: v });
     bucket = [];
   };
 
   for (const p of sorted) {
     const t = parseTS(p.timestamp).getTime();
+    if (t < binStart) continue;
     while (t >= binEnd) {
       flush();
       binStart = binEnd;
@@ -46,6 +50,60 @@ function aggregateSeries(points, binMs, mode = "avg") {
   }
   flush();
   return out;
+}
+
+// ---- Timezone helpers (US/Eastern) ----
+function getETParts(ms) {
+  const d = new Date(ms);
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).formatToParts(d);
+  const pick = (t) => parseInt(parts.find((p) => p.type === t).value, 10);
+  return { y: pick("year"), m: pick("month"), d: pick("day"), h: pick("hour"), min: pick("minute") };
+}
+
+function getETOffsetMinutesForYMD(y, m, d) {
+  // Probe noon ET that day to get the correct DST offset.
+  const probe = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      timeZoneName: "shortOffset"
+    }).formatToParts(probe);
+    const tzn = parts.find((p) => p.type === "timeZoneName")?.value || "GMT-5";
+    const mMatch = tzn.match(/GMT([+-]\d{1,2})(?::(\d{2}))?/);
+    if (mMatch) {
+      const sign = mMatch[1].startsWith("-") ? -1 : 1;
+      const hours = Math.abs(parseInt(mMatch[1], 10));
+      const minutes = mMatch[2] ? parseInt(mMatch[2], 10) : 0;
+      return sign * (hours * 60 + minutes); // e.g. -240 for EDT
+    }
+  } catch {}
+  return -300; // fallback to EST
+}
+
+function etWallTimeToUtcMs(y, m, d, h = 0, min = 0) {
+  const offsetMin = getETOffsetMinutesForYMD(y, m, d); // ET = UTC + offset
+  return Date.UTC(y, m - 1, d, h, min, 0) - offsetMin * 60_000;
+}
+
+function getEtDaySessionRangeUtc(anchorMs) {
+  const { y, m, d } = getETParts(anchorMs);
+  const openUtc = etWallTimeToUtcMs(y, m, d, 9, 30);
+  const closeUtc = etWallTimeToUtcMs(y, m, d, 16, 0);
+  return { start: openUtc, end: closeUtc };
+}
+
+function getEtHourRangeUtc(anchorMs) {
+  const { y, m, d, h } = getETParts(anchorMs);
+  const start = etWallTimeToUtcMs(y, m, d, h, 0);
+  return { start, end: start + 60 * 60 * 1000 };
 }
 
 const fmtLabel = (ts, timeframe) => {
@@ -62,8 +120,8 @@ const fmtLabel = (ts, timeframe) => {
 };
 
 export default function Dashboard() {
-  const [data, setData] = useState(null);           // trades
-  const [priceData, setPriceData] = useState(null); // {AAPL:[{timestamp,close}], MSFT:[...]}
+  const [data, setData] = useState(null);             // trades
+  const [priceData, setPriceData] = useState(null);   // {AAPL:[{timestamp,close}], MSFT:[...]}
   const [zscoreData, setZscoreData] = useState(null); // [{timestamp,z_score,spread,...}]
   const [pnlData, setPnlData] = useState(null);       // [{timestamp,cumulative_pnl,...}]
   const [timeframe, setTimeframe] = useState("week"); // 'week' | 'day' | 'hour'
@@ -73,17 +131,16 @@ export default function Dashboard() {
       try {
         const [tradeRes, priceRes, zscoreRes, pnlRes] = await Promise.all([
           fetch("http://localhost:5050/trade-history"),
-          // large limit so “week” has enough history; aggregation keeps it readable
           fetch("http://localhost:5050/prices?symbols=AAPL,MSFT&limit=50000"),
           fetch("http://localhost:5050/stock-zscores"),
-          fetch("http://localhost:5050/pnl-history"),
+          fetch("http://localhost:5050/pnl-history")
         ]);
 
         const [tradeJson, priceJson, zscoreJson, pnlJson] = await Promise.all([
           tradeRes.json(),
           priceRes.json(),
           zscoreRes.json(),
-          pnlRes.json(),
+          pnlRes.json()
         ]);
 
         setData(tradeJson);
@@ -100,62 +157,129 @@ export default function Dashboard() {
     return () => clearInterval(id);
   }, []);
 
-  // ---------- compute timeframe parameters (no conditional hooks) ----------
-  const now = Date.now();
-  const { cutoff, binMs, maxTicks } = useMemo(() => {
-    const c =
-      timeframe === "hour"
-        ? now - 60 * 60 * 1000
-        : timeframe === "day"
-        ? now - 24 * 60 * 60 * 1000
-        : now - 7 * 24 * 60 * 60 * 1000;
+  // ---------- timestamps present in data ----------
+  const allTimestamps = useMemo(() => {
+    const ts = [];
+    (zscoreData ?? []).forEach((d) => ts.push(parseTS(d.timestamp).getTime()));
+    (pnlData ?? []).forEach((d) => ts.push(parseTS(d.timestamp).getTime()));
+    if (priceData) {
+      (priceData.AAPL ?? []).forEach((p) => ts.push(parseTS(p.timestamp).getTime()));
+      (priceData.MSFT ?? []).forEach((p) => ts.push(parseTS(p.timestamp).getTime()));
+    }
+    return ts.sort((a, b) => a - b);
+  }, [zscoreData, pnlData, priceData]);
 
-    const b =
-      timeframe === "hour" ? 60 * 1000 : timeframe === "day" ? 5 * 60 * 1000 : 30 * 60 * 1000;
+  const lastDataMs = useMemo(
+    () => (allTimestamps.length ? allTimestamps[allTimestamps.length - 1] : Date.now()),
+    [allTimestamps]
+  );
 
-    const ticks = timeframe === "hour" ? 12 : timeframe === "day" ? 24 : 14;
+  const hasDataBetween = useCallback(
+    (start, end) => allTimestamps.some((t) => t >= start && t <= end),
+    [allTimestamps]
+  );
 
-    return { cutoff: c, binMs: b, maxTicks: ticks };
-  }, [timeframe, now]);
+  // ---------- compute the visible window (start/end) + binning ----------
+  const { windowStart, windowEnd, binMs, maxTicks } = useMemo(() => {
+    let start, end, bins, ticks;
+    const nowMs = Date.now();
 
-  // ---------- build series with filtering + aggregation (hooks always run) ----------
-  // z-score
+    if (timeframe === "day") {
+      const today = getEtDaySessionRangeUtc(nowMs);
+      const liveHas = hasDataBetween(today.start, today.end);
+      if (liveHas) {
+        start = today.start;
+        end = Math.min(today.end, nowMs); // fills as the day goes on
+      } else {
+        const last = getEtDaySessionRangeUtc(lastDataMs);
+        start = last.start;
+        end = Math.min(last.end, lastDataMs);
+      }
+      bins = 5 * 60 * 1000; // 5-minute bars
+      ticks = 24;
+    } else if (timeframe === "hour") {
+      const currHr = getEtHourRangeUtc(nowMs);
+      const liveHas = hasDataBetween(currHr.start, currHr.end);
+      if (liveHas) {
+        start = currHr.start;
+        end = Math.min(currHr.end, nowMs);
+      } else {
+        const lastHr = getEtHourRangeUtc(lastDataMs);
+        start = lastHr.start;
+        end = Math.min(lastHr.end, lastDataMs);
+      }
+      bins = 60 * 1000; // 1-minute bars
+      ticks = 12;
+    } else {
+      // week: anchor to last datapoint
+      end = lastDataMs;
+      start = end - 7 * 24 * 60 * 60 * 1000;
+      bins = 30 * 60 * 1000; // 30-minute bars
+      ticks = 14;
+    }
+
+    return { windowStart: start, windowEnd: end, binMs: bins, maxTicks: ticks };
+  }, [timeframe, lastDataMs, hasDataBetween]);
+
+  const alignStart = useMemo(
+    () => Math.floor(windowStart / binMs) * binMs,
+    [windowStart, binMs]
+  );
+
+  // ---------- build series bounded by [windowStart, windowEnd] ----------
   const zRaw = useMemo(() => {
     const src = zscoreData || [];
     return src
-      .filter((d) => parseTS(d.timestamp).getTime() >= cutoff)
-      .map((d) => ({ timestamp: d.timestamp, value: Number(d.z_score) }));
-  }, [zscoreData, cutoff]);
+      .map((d) => ({ t: parseTS(d.timestamp).getTime(), v: Number(d.z_score), ts: d.timestamp }))
+      .filter((d) => d.t >= windowStart && d.t <= windowEnd)
+      .map((d) => ({ timestamp: d.ts, value: d.v }));
+  }, [zscoreData, windowStart, windowEnd]);
 
-  const zAgg = useMemo(() => aggregateSeries(zRaw, binMs, "avg"), [zRaw, binMs]);
-
-  // PnL (cumulative -> last per bin)
   const pnlRaw = useMemo(() => {
     const src = pnlData || [];
     return src
-      .filter((d) => parseTS(d.timestamp).getTime() >= cutoff)
-      .map((d) => ({ timestamp: d.timestamp, value: Number(d.cumulative_pnl) }));
-  }, [pnlData, cutoff]);
+      .map((d) => ({
+        t: parseTS(d.timestamp).getTime(),
+        v: Number(d.cumulative_pnl),
+        ts: d.timestamp
+      }))
+      .filter((d) => d.t >= windowStart && d.t <= windowEnd)
+      .map((d) => ({ timestamp: d.ts, value: d.v }));
+  }, [pnlData, windowStart, windowEnd]);
 
-  const pnlAgg = useMemo(() => aggregateSeries(pnlRaw, binMs, "last"), [pnlRaw, binMs]);
-
-  // prices
   const aaplRaw = useMemo(() => {
     const src = (priceData && priceData.AAPL) || [];
     return src
-      .filter((p) => parseTS(p.timestamp).getTime() >= cutoff)
-      .map((p) => ({ timestamp: p.timestamp, value: Number(p.close) }));
-  }, [priceData, cutoff]);
+      .map((p) => ({ t: parseTS(p.timestamp).getTime(), v: Number(p.close), ts: p.timestamp }))
+      .filter((p) => p.t >= windowStart && p.t <= windowEnd)
+      .map((p) => ({ timestamp: p.ts, value: p.v }));
+  }, [priceData, windowStart, windowEnd]);
 
   const msftRaw = useMemo(() => {
     const src = (priceData && priceData.MSFT) || [];
     return src
-      .filter((p) => parseTS(p.timestamp).getTime() >= cutoff)
-      .map((p) => ({ timestamp: p.timestamp, value: Number(p.close) }));
-  }, [priceData, cutoff]);
+      .map((p) => ({ t: parseTS(p.timestamp).getTime(), v: Number(p.close), ts: p.timestamp }))
+      .filter((p) => p.t >= windowStart && p.t <= windowEnd)
+      .map((p) => ({ timestamp: p.ts, value: p.v }));
+  }, [priceData, windowStart, windowEnd]);
 
-  const aaplAgg = useMemo(() => aggregateSeries(aaplRaw, binMs, "avg"), [aaplRaw, binMs]);
-  const msftAgg = useMemo(() => aggregateSeries(msftRaw, binMs, "avg"), [msftRaw, binMs]);
+  // Aggregate (aligned to the visible window)
+  const zAgg = useMemo(
+    () => aggregateSeries(zRaw, binMs, "avg", alignStart),
+    [zRaw, binMs, alignStart]
+  );
+  const pnlAgg = useMemo(
+    () => aggregateSeries(pnlRaw, binMs, "last", alignStart),
+    [pnlRaw, binMs, alignStart]
+  );
+  const aaplAgg = useMemo(
+    () => aggregateSeries(aaplRaw, binMs, "avg", alignStart),
+    [aaplRaw, binMs, alignStart]
+  );
+  const msftAgg = useMemo(
+    () => aggregateSeries(msftRaw, binMs, "avg", alignStart),
+    [msftRaw, binMs, alignStart]
+  );
 
   // ---------- shared chart options ----------
   const baseOptions = useMemo(
@@ -215,10 +339,9 @@ export default function Dashboard() {
     [pnlAgg, timeframe]
   );
 
-  const priceChartData = useMemo(() => {
-    const labels = aaplAgg.map((p) => fmtLabel(p.timestamp, timeframe));
-    return {
-      labels,
+  const aaplChartData = useMemo(
+    () => ({
+      labels: aaplAgg.map((p) => fmtLabel(p.timestamp, timeframe)),
       datasets: [
         {
           label: "AAPL",
@@ -226,7 +349,16 @@ export default function Dashboard() {
           borderColor: "#22c55e",
           fill: false,
           tension: 0.35
-        },
+        }
+      ]
+    }),
+    [aaplAgg, timeframe]
+  );
+
+  const msftChartData = useMemo(
+    () => ({
+      labels: msftAgg.map((p) => fmtLabel(p.timestamp, timeframe)),
+      datasets: [
         {
           label: "MSFT",
           data: msftAgg.map((p) => p.value),
@@ -235,10 +367,10 @@ export default function Dashboard() {
           tension: 0.35
         }
       ]
-    };
-  }, [aaplAgg, msftAgg, timeframe]);
+    }),
+    [msftAgg, timeframe]
+  );
 
-  // After all hooks are declared, it’s safe to do a loading guard for the UI:
   const isLoading = !data || !priceData || !zscoreData || !pnlData;
 
   if (isLoading) {
@@ -262,7 +394,7 @@ export default function Dashboard() {
         ))}
       </div>
 
-      {/* TOP ROW: Z-Score & PnL side-by-side */}
+      {/* TOP ROW: Z-Score & PnL */}
       <div className="grid grid-cols-2 gap-6 mb-6">
         <Card className="bg-gray-800">
           <CardContent>
@@ -283,15 +415,26 @@ export default function Dashboard() {
         </Card>
       </div>
 
-      {/* BOTTOM ROW: Stock Prices full-width */}
-      <Card className="bg-gray-800">
-        <CardContent>
-          <h2 className="text-lg font-semibold mb-3">Stock Prices</h2>
-          <div className="h-80">
-            <Line data={priceChartData} options={baseOptions} />
-          </div>
-        </CardContent>
-      </Card>
+      {/* BOTTOM ROW: AAPL & MSFT side-by-side */}
+      <div className="grid grid-cols-2 gap-6">
+        <Card className="bg-gray-800">
+          <CardContent>
+            <h2 className="text-lg font-semibold mb-3">AAPL</h2>
+            <div className="h-80">
+              <Line data={aaplChartData} options={baseOptions} />
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-gray-800">
+          <CardContent>
+            <h2 className="text-lg font-semibold mb-3">MSFT</h2>
+            <div className="h-80">
+              <Line data={msftChartData} options={baseOptions} />
+            </div>
+          </CardContent>
+        </Card>
+      </div>
     </div>
   );
 }
