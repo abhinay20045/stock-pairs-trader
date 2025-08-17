@@ -5,6 +5,11 @@ from flask import Flask, Response, json, jsonify, request
 from flask_cors import CORS
 from pymongo import MongoClient, DESCENDING
 from datetime import datetime, timezone
+from celery_worker.tasks import backtest_pairs_task
+import pandas as pd
+import yfinance as yf
+import numpy as np
+import math
 
 # If you still need your blueprint, keep this:
 try:
@@ -26,7 +31,6 @@ CORS(app)
 if pair_bp:
     app.register_blueprint(pair_bp)
 
-client = MongoClient("mongodb://mongo:27017")
 client = MongoClient("mongodb://mongo:27017", tz_aware=True, tzinfo=timezone.utc)
 db = client["trading_db"]
 
@@ -37,17 +41,12 @@ db = client["trading_db"]
 def health():
     return {"status": "ok"}
 
-
 @app.route("/test-db")
 def test_db():
     db.test_collection.insert_one({"status": "working"})
     count = db.test_collection.count_documents({})
     return {"message": f"Mongo test successful. Docs in test_collection: {count}"}
 
-
-# ------------------------------
-# Task triggers (match new tasks)
-# ------------------------------
 @app.route("/run-cycle", methods=["POST", "GET"])
 def run_cycle():
     """
@@ -61,13 +60,11 @@ def run_cycle():
     res = trigger_chain.apply_async(kwargs={"model_name": model, "strategy_name": strategy})
     return jsonify({"task_id": res.id, "status": "submitted", "model": model, "strategy": strategy})
 
-
 @app.route("/fetch-prices", methods=["POST", "GET"])
 def fetch_prices():
     """Manually fetch latest prices (7-day lookback window policy is in the task)."""
     res = fetch_and_store_prices_task.apply_async()
     return jsonify({"task_id": res.id, "status": "submitted"})
-
 
 @app.route("/model-backfill", methods=["POST", "GET"])
 def model_backfill():
@@ -76,7 +73,6 @@ def model_backfill():
     res = model_backfill_task.apply_async(kwargs={"model_name": model})
     return jsonify({"task_id": res.id, "status": "submitted", "model": model})
 
-
 @app.route("/evaluate", methods=["POST", "GET"])
 def evaluate_once():
     """Run evaluate/execute step only."""
@@ -84,7 +80,6 @@ def evaluate_once():
     strategy = request.args.get("strategy", "zscore")
     res = evaluate_and_place_trade_task.apply_async(kwargs={"model_name": model, "strategy_name": strategy})
     return jsonify({"task_id": res.id, "status": "submitted", "model": model, "strategy": strategy})
-
 
 # ------------------------------
 # Data APIs used by the frontend
@@ -118,7 +113,6 @@ def trade_history():
 
     return jsonify([serialize_trade(t) for t in trades])
 
-
 @app.route("/stock-zscores", methods=["GET"])
 def stock_zscores():
     """
@@ -146,7 +140,6 @@ def stock_zscores():
         }
 
     return jsonify([serialize(d) for d in docs])
-
 
 @app.route("/prices", methods=["GET"])
 def prices():
@@ -181,7 +174,6 @@ def prices():
                 series.append({"timestamp": ts, "close": float(close)})
         out[sym] = list(reversed(series))
     return jsonify(out)
-
 
 @app.route("/pnl-history", methods=["GET"])
 def pnl_history():
@@ -256,7 +248,151 @@ def pnl_history():
 
     return jsonify(points)
 
+def _get_latest_run():
+    return db.bt_runs.find_one(sort=[("_id", DESCENDING)])
 
+def _resolve_run_id(run_id: str | None):
+    if not run_id or run_id == "latest":
+        last = _get_latest_run()
+        return (last or {}).get("run_id")
+    return run_id
+
+@app.post("/backtest")
+def start_backtest():
+    payload = request.get_json(force=True, silent=True) or {}
+    params = {
+        "symbols": tuple(payload.get("symbols", ["AAPL", "MSFT"])),
+        "start": payload.get("start", "2023-01-01"),
+        "end": payload.get("end"),
+        "interval": payload.get("interval", "1d"),
+        "lookback": int(payload.get("lookback", 60)),
+        "entry_z": float(payload.get("entry_z", 2.0)),
+        "exit_z": float(payload.get("exit_z", 0.5)),
+        "notional_per_leg": float(payload.get("notional_per_leg", 1000.0)),
+        "fee_bps": float(payload.get("fee_bps", 1.0)),
+    }
+    backtest_pairs_task.delay(params)  # Celery worker assigns run_id and writes results
+    return jsonify({"status": "STARTED"}), 202
+
+@app.get("/backtest/latest-run")
+def backtest_latest_run():
+    doc = _get_latest_run()
+    if not doc:
+        return jsonify({"error": "no backtest runs found"}), 404
+    return jsonify({
+        "run_id": doc.get("run_id"),
+        "params": doc.get("params"),
+        "summary": doc.get("summary"),
+        "started_at": doc.get("started_at"),
+        "finished_at": doc.get("finished_at"),
+        "status": doc.get("status"),
+    })
+
+@app.get("/backtest/runs")
+def list_backtest_runs():
+    runs = list(
+        db.bt_runs.find(
+            {},
+            {"_id": 0, "run_id": 1, "params": 1, "summary": 1, "status": 1, "started_at": 1, "finished_at": 1}
+        ).sort([("_id", DESCENDING)])
+    )
+    return jsonify(runs)
+
+@app.get("/backtest/series")
+def backtest_series():
+    """
+    Returns per-bar series produced by the backtest worker for a given run:
+    {
+      "run_id": "...",
+      "s1": "AAPL",
+      "s2": "MSFT",
+      "points": [
+        {"t": ISO8601, "price1": float, "price2": float, "spread": float, "z": float, "beta": float},
+        ...
+      ]
+    }
+    """
+    run_id = _resolve_run_id(request.args.get("run_id"))
+    if not run_id:
+        return jsonify({"run_id": None, "points": []})
+    cur = db.bt_series.find({"run_id": run_id}).sort([("timestamp", 1)])
+    rows = list(cur)
+    if not rows:
+        return jsonify({"run_id": run_id, "points": []})
+    s1 = rows[0].get("s1")
+    s2 = rows[0].get("s2")
+    pts = [{
+        "t": r["timestamp"],
+        "price1": float(r["price1"]) if r.get("price1") is not None else None,
+        "price2": float(r["price2"]) if r.get("price2") is not None else None,
+        "spread": float(r["spread"]) if r.get("spread") is not None else None,
+        "z": float(r["z"]) if r.get("z") is not None else None,
+        "beta": float(r["beta"]) if r.get("beta") is not None else None,
+    } for r in rows]
+    return jsonify({"run_id": run_id, "s1": s1, "s2": s2, "points": pts})
+
+@app.get("/backtest/pnl")
+def backtest_pnl():
+    """
+    Returns cumulative PnL time series for the run:
+    {"run_id": "...", "points": [{"t": ISO8601, "pnl": float}, ...]}
+    """
+    run_id = _resolve_run_id(request.args.get("run_id"))
+    if not run_id:
+        return jsonify({"run_id": None, "points": []})
+    cur = db.bt_pnl.find({"run_id": run_id}).sort([("timestamp", 1)])
+    data = [{"t": d["timestamp"], "pnl": float(d.get("cumulative_pnl", 0.0))} for d in cur]
+    return jsonify({"run_id": run_id, "points": data})
+
+@app.get("/backtest/trades")
+def backtest_trades():
+    """
+    Returns normalized trades for the run (entries & exits):
+    {"run_id": "...", "trades": [{"t": ISO8601, "side": "ENTRY/EXIT ...", ...}, ...]}
+    """
+    run_id = _resolve_run_id(request.args.get("run_id"))
+    if not run_id:
+        return jsonify({"run_id": None, "trades": []}), 200
+
+    cur = db.bt_trades.find(
+        {"run_id": run_id},
+        {
+            "_id": 0,
+            "timestamp": 1,
+            "side": 1,
+            "s1": 1,
+            "s2": 1,
+            "qty1": 1,
+            "qty2": 1,
+            "price1": 1,
+            "price2": 1,
+            "pnl": 1,
+            "cum_pnl": 1,
+            "bars_held": 1,
+            "beta": 1,
+        }
+    ).sort([("timestamp", 1)])
+
+    trades = []
+    for d in cur:
+        ts = d.get("timestamp")
+        trades.append({
+            "timestamp": ts,                 # full key for generic clients
+            "t": ts,                         # short key for charting consistency
+            "side": d.get("side"),
+            "s1": d.get("s1"),
+            "s2": d.get("s2"),
+            "beta": float(d["beta"]) if d.get("beta") is not None else None,
+            "qty1": float(d["qty1"]) if d.get("qty1") is not None else None,
+            "qty2": float(d["qty2"]) if d.get("qty2") is not None else None,
+            "price1": float(d["price1"]) if d.get("price1") is not None else None,
+            "price2": float(d["price2"]) if d.get("price2") is not None else None,
+            "pnl": float(d["pnl"]) if d.get("pnl") is not None else None,
+            "cum_pnl": float(d["cum_pnl"]) if d.get("cum_pnl") is not None else None,
+            "bars_held": d.get("bars_held"),
+        })
+
+    return jsonify({"run_id": run_id, "trades": trades}), 200
 # ------------------------------
 # Debug helpers (unchanged API)
 # ------------------------------

@@ -11,6 +11,7 @@ import pandas as pd
 import yfinance as yf
 from celery import Celery, chain
 from pymongo import MongoClient, UpdateOne, ASCENDING
+from celery_worker.backtest import run_pairs_backtest
 
 # For proper Engle–Granger cointegration:
 import statsmodels.api as sm
@@ -450,6 +451,10 @@ def evaluate_and_place_trade_task(model_name: str = MODEL_NAME, strategy_name: s
 @app.task(name="celery_worker.tasks.cleanup_old_data_task")
 def cleanup_old_data_task(days: int = LOOKBACK_DAYS):
     return cleanup(days)
+
+@app.task
+def backtest_pairs_task(params):
+    return run_pairs_backtest(**params)
 
 @app.task(name="celery_worker.tasks.trigger_chain")
 def trigger_chain(model_name: str = MODEL_NAME, strategy_name: str = STRATEGY_NAME):
