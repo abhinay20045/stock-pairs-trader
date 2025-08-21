@@ -14,12 +14,7 @@ import {
 ChartJS.register(LineElement, CategoryScale, LinearScale, PointElement, Tooltip, Legend);
 
 // ---------- helpers ----------
-const toDate = (t) => (t instanceof Date ? t : new Date(t));
-const safeMs = (t) => {
-  const ms = toDate(t).getTime();
-  return Number.isFinite(ms) ? ms : NaN;
-};
-const isFiniteNum = (x) => Number.isFinite(x) && !Number.isNaN(x);
+const parseTS = (t) => new Date(t);
 const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
 
 const intervalToMs = (interval) => {
@@ -36,15 +31,11 @@ const intervalToMs = (interval) => {
 // mode: "avg" (default) or "last" (for cumulative series).
 // startAtMs aligns bins to a fixed start so charts don't jitter.
 function aggregateSeries(points, binMs, mode = "avg", startAtMs) {
-  if (!Array.isArray(points) || points.length === 0 || !binMs) return [];
+  if (!points || points.length === 0) return [];
   const out = [];
-  const sorted = points
-    .map((p) => ({ ms: safeMs(p.timestamp), v: Number(p.value) }))
-    .filter((p) => isFiniteNum(p.ms) && isFiniteNum(p.v))
-    .sort((a, b) => a.ms - b.ms);
-  if (!sorted.length) return [];
+  const sorted = [...points].sort((a, b) => parseTS(a.timestamp) - parseTS(b.timestamp));
 
-  let binStart = startAtMs ?? Math.floor(sorted[0].ms / binMs) * binMs;
+  let binStart = startAtMs ?? Math.floor(parseTS(sorted[0].timestamp).getTime() / binMs) * binMs;
   let binEnd = binStart + binMs;
   let bucket = [];
 
@@ -52,19 +43,19 @@ function aggregateSeries(points, binMs, mode = "avg", startAtMs) {
     if (!bucket.length) return;
     const ts = new Date(binEnd - 1).toISOString();
     const v = mode === "last" ? bucket[bucket.length - 1] : avg(bucket);
-    if (isFiniteNum(v)) out.push({ timestamp: ts, value: v });
+    out.push({ timestamp: ts, value: v });
     bucket = [];
   };
 
   for (const p of sorted) {
-    const t = p.ms;
+    const t = parseTS(p.timestamp).getTime();
     if (t < binStart) continue;
     while (t >= binEnd) {
       flush();
       binStart = binEnd;
       binEnd += binMs;
     }
-    if (isFiniteNum(p.v)) bucket.push(p.v);
+    bucket.push(p.value);
   }
   flush();
   return out;
@@ -124,7 +115,7 @@ function getEtHourRangeUtc(anchorMs) {
 }
 
 const fmtLabel = (ts, timeframe) => {
-  const d = toDate(ts);
+  const d = new Date(ts);
   if (timeframe === "hour") return d.toLocaleTimeString();
   if (timeframe === "day")
     return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -147,6 +138,18 @@ const DEFAULT_BT_PARAMS = {
   fee_bps: 1.0
 };
 
+// Utility: nearest index in aggregated points by timestamp (ms)
+function nearestIndexByTime(aggPoints, targetMs) {
+  if (!aggPoints || aggPoints.length === 0) return -1;
+  let best = -1, bestDiff = Infinity;
+  for (let i = 0; i < aggPoints.length; i++) {
+    const ms = new Date(aggPoints[i].timestamp).getTime();
+    const d = Math.abs(ms - targetMs);
+    if (d < bestDiff) { best = i; bestDiff = d; }
+  }
+  return best;
+}
+
 export default function Dashboard() {
   // Mode
   const [mode, setMode] = useState("live"); // 'live' | 'backtest'
@@ -154,7 +157,7 @@ export default function Dashboard() {
   // Live data
   const [liveTrades, setLiveTrades] = useState(null);
   const [livePrices, setLivePrices] = useState(null);   // {AAPL:[{timestamp,close}], MSFT:[...]}
-  const [liveZ, setLiveZ] = useState(null);             // [{timestamp, z_score | resid_z}]
+  const [liveZ, setLiveZ] = useState(null);             // [{timestamp,z_score}]
   const [livePnl, setLivePnl] = useState(null);         // [{timestamp,cumulative_pnl}]
 
   // Backtest data + state
@@ -193,10 +196,10 @@ export default function Dashboard() {
           zscoreRes.json(),
           pnlRes.json()
         ]);
-        setLiveTrades(Array.isArray(tradeJson) ? tradeJson : []);
-        setLivePrices(priceJson && typeof priceJson === 'object' ? priceJson : {});
-        setLiveZ(Array.isArray(zscoreJson) ? zscoreJson : []);
-        setLivePnl(Array.isArray(pnlJson) ? pnlJson : []);
+        setLiveTrades(tradeJson);
+        setLivePrices(priceJson);
+        setLiveZ(zscoreJson);
+        setLivePnl(pnlJson);
       } catch (e) {
         console.error("Live fetch error:", e);
       }
@@ -221,9 +224,12 @@ export default function Dashboard() {
   // Start a new backtest then begin waiting for the new run to appear
   const handleBacktestClick = useCallback(async () => {
     if (mode === "backtest" && (btPhase === "starting" || btPhase === "waiting")) return;
+    // switch mode first so UI shows the backtest area
     setMode("backtest");
     setBtPhase("starting");
     setBtMsg("Starting backtest…");
+
+    // mark the time of launch so we can identify the new run
     launchEpochRef.current = Date.now();
 
     try {
@@ -246,6 +252,7 @@ export default function Dashboard() {
     if (mode !== "backtest") return;
     if (btPhase !== "waiting") return;
 
+    // Clear any stale timer
     if (pollRunTimerRef.current) {
       clearInterval(pollRunTimerRef.current);
       pollRunTimerRef.current = null;
@@ -259,6 +266,8 @@ export default function Dashboard() {
         const res = await fetch("http://localhost:5050/backtest/latest-run");
         if (!res.ok) return; // still 404; keep waiting
         const runJson = await res.json();
+
+        // If this run is new enough, adopt it and move to streaming
         const startedAt = runJson?.started_at ? new Date(runJson.started_at).getTime() : 0;
         if (startedAt >= launchedAfter - fudge || !startedAt) {
           setRun(runJson);
@@ -270,6 +279,7 @@ export default function Dashboard() {
       }
     }
 
+    // first check immediately, then every 2s
     checkLatestRun();
     pollRunTimerRef.current = setInterval(checkLatestRun, 2000);
 
@@ -287,6 +297,7 @@ export default function Dashboard() {
     if (btPhase !== "streaming") return;
     if (!run?.run_id) return;
 
+    // Clear any prior data poller
     if (pollDataTimerRef.current) {
       clearInterval(pollDataTimerRef.current);
       pollDataTimerRef.current = null;
@@ -314,6 +325,7 @@ export default function Dashboard() {
 
         if (stopped) return;
 
+        // normalize
         const pnlPoints = (pnlJson.points || []).map((p) => ({
           timestamp: p.t,
           cumulative_pnl: p.pnl
@@ -335,6 +347,7 @@ export default function Dashboard() {
       }
     }
 
+    // initial pull + poll every 3s
     pullAll();
     pollDataTimerRef.current = setInterval(pullAll, 3000);
 
@@ -362,7 +375,7 @@ export default function Dashboard() {
     pollDataTimerRef.current = null;
   }, [mode]);
 
-  // ---------- pick the active datasets (memoized) ----------
+  // ---------- pick the active datasets ----------
   const activePrices = useMemo(() => {
     if (mode === "live") return livePrices || {};
     if (btSeries) {
@@ -371,28 +384,28 @@ export default function Dashboard() {
         MSFT: btSeries.map((r) => ({ timestamp: r.timestamp, close: r.p2 }))
       };
     }
-    return {};
+    return null;
   }, [mode, livePrices, btSeries]);
 
   const activeZ = useMemo(() => {
-    if (mode === "live") return Array.isArray(liveZ) ? liveZ : [];
+    if (mode === "live") return liveZ || [];
     if (btSeries) return btSeries.map((r) => ({ timestamp: r.timestamp, z_score: r.z }));
     return [];
   }, [mode, liveZ, btSeries]);
 
   const activePnl = useMemo(() => {
-    if (mode === "live") return Array.isArray(livePnl) ? livePnl : [];
-    return Array.isArray(btPnl) ? btPnl : [];
+    if (mode === "live") return livePnl || [];
+    return btPnl || [];
   }, [mode, livePnl, btPnl]);
 
   // ---------- timestamps present in active data ----------
   const allTimestamps = useMemo(() => {
     const ts = [];
-    (activeZ ?? []).forEach((d) => { const ms = safeMs(d.timestamp); if (isFiniteNum(ms)) ts.push(ms); });
-    (activePnl ?? []).forEach((d) => { const ms = safeMs(d.timestamp); if (isFiniteNum(ms)) ts.push(ms); });
+    (activeZ ?? []).forEach((d) => ts.push(parseTS(d.timestamp).getTime()));
+    (activePnl ?? []).forEach((d) => ts.push(parseTS(d.timestamp).getTime()));
     if (activePrices) {
-      (activePrices.AAPL ?? []).forEach((p) => { const ms = safeMs(p.timestamp); if (isFiniteNum(ms)) ts.push(ms); });
-      (activePrices.MSFT ?? []).forEach((p) => { const ms = safeMs(p.timestamp); if (isFiniteNum(ms)) ts.push(ms); });
+      (activePrices.AAPL ?? []).forEach((p) => ts.push(parseTS(p.timestamp).getTime()));
+      (activePrices.MSFT ?? []).forEach((p) => ts.push(parseTS(p.timestamp).getTime()));
     }
     return ts.sort((a, b) => a - b);
   }, [activeZ, activePnl, activePrices]);
@@ -409,15 +422,17 @@ export default function Dashboard() {
 
   // ---------- compute visible window + binning ----------
   const { windowStart, windowEnd, binMs, maxTicks } = useMemo(() => {
+    // Backtest: lock to tested range and use the run's interval
     if (mode === "backtest" && run?.params) {
-      const start = safeMs(run.params.start);
-      const end = safeMs(run.params.end || run.finished_at || run.started_at || Date.now());
+      const start = parseTS(run.params.start).getTime();
+      const end = parseTS(run.params.end || run.finished_at || run.started_at || Date.now()).getTime();
       const bins = intervalToMs(run.params.interval || "1d");
       const spanDays = Math.max(1, Math.round((end - start) / (24 * 60 * 60 * 1000)));
       const ticks = Math.min(20, Math.max(8, Math.round(spanDays / 15)));
       return { windowStart: start, windowEnd: end, binMs: bins, maxTicks: ticks };
     }
 
+    // Live (existing behavior)
     let start, end, bins, ticks;
     const nowMs = Date.now();
 
@@ -463,47 +478,50 @@ export default function Dashboard() {
   );
 
   // ---------- build series bounded by [windowStart, windowEnd] ----------
-  // IMPORTANT FIX: support z_like fallback (z_score OR resid_z) + guard invalid timestamps
   const zRaw = useMemo(() => {
-    const src = Array.isArray(activeZ) ? activeZ : [];
-    return src
-      .map((d) => ({
-        t: safeMs(d.timestamp),
-        v: Number(d.z_score ?? d.resid_z ?? d.z_like ?? d.z),
-        ts: d.timestamp
-      }))
-      .filter((d) => isFiniteNum(d.t) && isFiniteNum(d.v))
-      .filter((d) => d.t >= windowStart && d.t <= windowEnd)
-      .map((d) => ({ timestamp: d.ts, value: d.v }));
-  }, [activeZ, windowStart, windowEnd]);
+  // accept either an array or an object like { points: [...] }
+  const src = Array.isArray(activeZ) ? activeZ : (activeZ?.points ?? []);
+  return src
+    .map((d) => {
+      const t = new Date(d.timestamp).getTime();
+      const v = Number(
+        d.z_score ??
+        d.resid_z ??
+        d.z_like ??
+        d.z ??
+        (typeof d.value === "number" ? d.value : undefined)
+      );
+      return { t, v, ts: d.timestamp };
+    })
+    .filter((d) => Number.isFinite(d.t) && Number.isFinite(d.v))
+    .filter((d) => d.t >= windowStart && d.t <= windowEnd)
+    .map((d) => ({ timestamp: d.ts, value: d.v }));
+}, [activeZ, windowStart, windowEnd]);
 
   const pnlRaw = useMemo(() => {
-    const src = Array.isArray(activePnl) ? activePnl : [];
+    const src = activePnl || [];
     return src
       .map((d) => ({
-        t: safeMs(d.timestamp),
+        t: parseTS(d.timestamp).getTime(),
         v: Number(d.cumulative_pnl ?? d.value ?? 0),
         ts: d.timestamp
       }))
-      .filter((d) => isFiniteNum(d.t) && isFiniteNum(d.v))
       .filter((d) => d.t >= windowStart && d.t <= windowEnd)
       .map((d) => ({ timestamp: d.ts, value: d.v }));
   }, [activePnl, windowStart, windowEnd]);
 
   const aaplRaw = useMemo(() => {
-    const src = (activePrices && Array.isArray(activePrices.AAPL)) ? activePrices.AAPL : [];
+    const src = (activePrices && activePrices.AAPL) || [];
     return src
-      .map((p) => ({ t: safeMs(p.timestamp), v: Number(p.close), ts: p.timestamp }))
-      .filter((p) => isFiniteNum(p.t) && isFiniteNum(p.v))
+      .map((p) => ({ t: parseTS(p.timestamp).getTime(), v: Number(p.close), ts: p.timestamp }))
       .filter((p) => p.t >= windowStart && p.t <= windowEnd)
       .map((p) => ({ timestamp: p.ts, value: p.v }));
   }, [activePrices, windowStart, windowEnd]);
 
   const msftRaw = useMemo(() => {
-    const src = (activePrices && Array.isArray(activePrices.MSFT)) ? activePrices.MSFT : [];
+    const src = (activePrices && activePrices.MSFT) || [];
     return src
-      .map((p) => ({ t: safeMs(p.timestamp), v: Number(p.close), ts: p.timestamp }))
-      .filter((p) => isFiniteNum(p.t) && isFiniteNum(p.v))
+      .map((p) => ({ t: parseTS(p.timestamp).getTime(), v: Number(p.close), ts: p.timestamp }))
       .filter((p) => p.t >= windowStart && p.t <= windowEnd)
       .map((p) => ({ timestamp: p.ts, value: p.v }));
   }, [activePrices, windowStart, windowEnd]);
@@ -525,6 +543,96 @@ export default function Dashboard() {
     () => aggregateSeries(msftRaw, binMs, "avg", alignStart),
     [msftRaw, binMs, alignStart]
   );
+
+  // ---------- trade markers (entries/exits) on Z-score chart ----------
+  // Normalize trades from live/backtest into {tsMs, kind:'entry'|'exit', dir:'long'|'short'|null, pnl?:number}
+  const normalizedTrades = useMemo(() => {
+    const out = [];
+    if (mode === "live" && Array.isArray(liveTrades)) {
+      for (const t of liveTrades) {
+        const dir = (t.action || "").includes("long_aapl") ? "long" :
+                    (t.action || "").includes("short_aapl") ? "short" : null;
+        // entry
+        if (t.timestamp) {
+          out.push({ tsMs: parseTS(t.timestamp).getTime(), kind: "entry", dir, pnl: null });
+        }
+        // exit (only if closed)
+        if (t.status === "closed" && t.close_timestamp) {
+          out.push({
+            tsMs: parseTS(t.close_timestamp).getTime(),
+            kind: "exit",
+            dir,
+            pnl: typeof t.pnl === "number" ? t.pnl : (t.pnl ? Number(t.pnl) : null)
+          });
+        }
+      }
+    } else if (mode === "backtest" && Array.isArray(btTrades)) {
+      for (const t of btTrades) {
+        const tsStr = t.timestamp || t.t;
+        if (!tsStr) continue;
+        const side = (t.side || "").toUpperCase();
+        const kind = side.includes("ENTRY") ? "entry" : (side.includes("EXIT") ? "exit" : "entry");
+        const dir = side.includes("SHORT") ? "short" : (side.includes("LONG") ? "long" : null);
+        out.push({
+          tsMs: parseTS(tsStr).getTime(),
+          kind,
+          dir,
+          pnl: typeof t.pnl === "number" ? t.pnl : (t.pnl ? Number(t.pnl) : null)
+        });
+      }
+    }
+    return out.sort((a, b) => a.tsMs - b.tsMs);
+  }, [mode, liveTrades, btTrades]);
+
+  // Build per-point arrays aligned to zAgg indices for Chart.js
+  const tradeMarkerSeries = useMemo(() => {
+    const len = zAgg.length;
+    const mkEntry = Array(len).fill(null);
+    const mkExit  = Array(len).fill(null);
+    const entryColor = Array(len).fill(null);
+    const exitColor  = Array(len).fill(null);
+    const entryStyle = Array(len).fill("triangle");
+    const exitStyle  = Array(len).fill("circle");
+    const entryRadius= Array(len).fill(5);
+    const exitRadius = Array(len).fill(5);
+    const entryTip   = Array(len).fill(null);
+    const exitTip    = Array(len).fill(null);
+
+    for (const tr of normalizedTrades) {
+      const idx = nearestIndexByTime(zAgg, tr.tsMs);
+      if (idx < 0) continue;
+      const y = zAgg[idx]?.value ?? null;
+      if (y == null) continue;
+
+      if (tr.kind === "entry") {
+        mkEntry[idx] = y;
+        entryColor[idx] = tr.dir === "short" ? "#ef4444" : "#10b981"; // red short / green long
+        entryRadius[idx] = 6;
+        const when = new Date(tr.tsMs).toLocaleString();
+        entryTip[idx] = `Entry${tr.dir ? ` (${tr.dir})` : ""} — ${when}`;
+      } else {
+        mkExit[idx] = y;
+        // P/L -> color
+        let c = "#9ca3af";
+        if (typeof tr.pnl === "number") c = tr.pnl > 0 ? "#10b981" : (tr.pnl < 0 ? "#ef4444" : "#9ca3af");
+        exitColor[idx] = c;
+        // radius scaled by |pnl|
+        const r = Math.max(4, Math.min(9, 4 + Math.log10(Math.abs(tr.pnl || 0) + 1) * 3));
+        exitRadius[idx] = r;
+        const when = new Date(tr.tsMs).toLocaleString();
+        const pnlTxt = (typeof tr.pnl === "number") ? ` — PnL: ${tr.pnl.toFixed(2)}` : "";
+        exitTip[idx] = `Exit${pnlTxt} — ${when}`;
+      }
+    }
+
+    return {
+      mkEntry, mkExit,
+      entryColor, exitColor,
+      entryStyle, exitStyle,
+      entryRadius, exitRadius,
+      entryTip, exitTip
+    };
+  }, [zAgg, normalizedTrades]);
 
   // ---------- shared chart options ----------
   const baseOptions = useMemo(
@@ -550,6 +658,29 @@ export default function Dashboard() {
     [maxTicks]
   );
 
+  // Custom tooltip for Z chart to show trade info
+  const zOptions = useMemo(() => {
+    return {
+      ...baseOptions,
+      plugins: {
+        ...baseOptions.plugins,
+        tooltip: {
+          ...baseOptions.plugins.tooltip,
+          callbacks: {
+            label: (ctx) => {
+              const ds = ctx.dataset;
+              const idx = ctx.dataIndex;
+              const tipArr = ds.tooltipInfo || [];
+              const tip = tipArr[idx];
+              if (tip) return tip;
+              return `${ds.label}: ${ctx.formattedValue}`;
+            }
+          }
+        }
+      }
+    };
+  }, [baseOptions, tradeMarkerSeries]);
+
   // ---------- datasets ----------
   const labelTimeframe = mode === "backtest" ? "week" : timeframe;
 
@@ -558,15 +689,39 @@ export default function Dashboard() {
       labels: zAgg.map((p) => fmtLabel(p.timestamp, labelTimeframe)),
       datasets: [
         {
-          label: "Z-Like (z / resid_z)",
+          label: "Z-Score",
           data: zAgg.map((p) => p.value),
           borderColor: "#3b82f6",
           fill: false,
           tension: 0.35
+        },
+        // Entries overlay
+        {
+          label: "Entry",
+          data: tradeMarkerSeries.mkEntry,
+          borderColor: "rgba(0,0,0,0)",
+          pointBackgroundColor: tradeMarkerSeries.entryColor,
+          pointBorderColor: tradeMarkerSeries.entryColor,
+          pointRadius: tradeMarkerSeries.entryRadius,
+          pointStyle: tradeMarkerSeries.entryStyle,
+          showLine: false,
+          tooltipInfo: tradeMarkerSeries.entryTip
+        },
+        // Exits overlay
+        {
+          label: "Exit",
+          data: tradeMarkerSeries.mkExit,
+          borderColor: "rgba(0,0,0,0)",
+          pointBackgroundColor: tradeMarkerSeries.exitColor,
+          pointBorderColor: tradeMarkerSeries.exitColor,
+          pointRadius: tradeMarkerSeries.exitRadius,
+          pointStyle: tradeMarkerSeries.exitStyle,
+          showLine: false,
+          tooltipInfo: tradeMarkerSeries.exitTip
         }
       ]
     }),
-    [zAgg, labelTimeframe]
+    [zAgg, labelTimeframe, tradeMarkerSeries]
   );
 
   const pnlChartData = useMemo(
@@ -620,8 +775,39 @@ export default function Dashboard() {
 
   // readiness flags
   const isLiveReady = liveTrades && livePrices && liveZ && livePnl;
-  const isBacktestReady = (btPhase === "streaming") && run && btTrades && btPnl && btSeries;
-  const isLoading = (mode === "live" && !isLiveReady) || (mode === "backtest" && !isBacktestReady);
+  const isBacktestReady =
+    (btPhase === "streaming") &&
+    run && btTrades && btPnl && btSeries;
+
+  const isLoading =
+    (mode === "live" && !isLiveReady) ||
+    (mode === "backtest" && !isBacktestReady);
+
+  // --------- trade tables (open + closed) ----------
+  const openTrades = useMemo(() => {
+    if (mode === "live" && Array.isArray(liveTrades)) {
+      return liveTrades.filter(t => t.status === "open");
+    } else if (mode === "backtest" && Array.isArray(btTrades)) {
+      // backtest doesn't keep "open" state easily; approximate most recent ENTRYs not followed by EXIT yet
+      const stack = [];
+      for (const t of btTrades) {
+        const side = (t.side || "").toUpperCase();
+        if (side.includes("ENTRY")) stack.push(t);
+        else if (side.includes("EXIT")) stack.pop();
+      }
+      return stack;
+    }
+    return [];
+  }, [mode, liveTrades, btTrades]);
+
+  const closedTrades = useMemo(() => {
+    if (mode === "live" && Array.isArray(liveTrades)) {
+      return liveTrades.filter(t => t.status === "closed").slice(-10);
+    } else if (mode === "backtest" && Array.isArray(btTrades)) {
+      return btTrades.filter(t => (t.side || "").toUpperCase().includes("EXIT")).slice(-10);
+    }
+    return [];
+  }, [mode, liveTrades, btTrades]);
 
   return (
     <div className="p-6 bg-gray-900 min-h-screen text-white">
@@ -699,7 +885,7 @@ export default function Dashboard() {
               </div>
               <div className="mt-1">
                 <span className="text-gray-400">Tested Range:</span>{" "}
-                {run.params.start ? new Date(run.params.start).toLocaleDateString() : "—"} → {" "}
+                {run.params.start ? new Date(run.params.start).toLocaleDateString() : "—"} →{" "}
                 {run.params.end ? new Date(run.params.end).toLocaleDateString() : "—"}
               </div>
             </div>
@@ -712,12 +898,16 @@ export default function Dashboard() {
       ) : (
         <>
           {/* TOP ROW: Z-Score & PnL */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+          <div className="grid grid-cols-2 gap-6 mb-6">
             <Card className="bg-gray-800">
               <CardContent>
-                <h2 className="text-lg font-semibold mb-3">Z-Like Metric</h2>
+                <h2 className="text-lg font-semibold mb-3">Z-Score (with Trade Markers)</h2>
                 <div className="h-80">
-                  <Line data={zScoreChartData} options={baseOptions} />
+                  <Line data={zScoreChartData} options={zOptions} />
+                </div>
+                <div className="text-xs text-gray-400 mt-2 space-x-4">
+                  <span>▲ Entry (green = long AAPL / red = short AAPL)</span>
+                  <span>● Exit (green = profit / red = loss / gray = flat)</span>
                 </div>
               </CardContent>
             </Card>
@@ -733,7 +923,7 @@ export default function Dashboard() {
           </div>
 
           {/* BOTTOM ROW: AAPL & MSFT side-by-side */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="grid grid-cols-2 gap-6 mb-6">
             <Card className="bg-gray-800">
               <CardContent>
                 <h2 className="text-lg font-semibold mb-3">AAPL</h2>
@@ -749,6 +939,99 @@ export default function Dashboard() {
                 <div className="h-80">
                   <Line data={msftChartData} options={baseOptions} />
                 </div>
+              </CardContent>
+            </Card>
+          </div>
+
+          {/* TRADE TABLES */}
+          <div className="grid grid-cols-2 gap-6">
+            <Card className="bg-gray-800">
+              <CardContent>
+                <h2 className="text-lg font-semibold mb-3">Open Trades</h2>
+                {openTrades.length === 0 ? (
+                  <div className="text-sm text-gray-400">None</div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead className="text-gray-400">
+                        <tr>
+                          <th className="text-left p-2">Time</th>
+                          <th className="text-left p-2">Side</th>
+                          <th className="text-right p-2">AAPL</th>
+                          <th className="text-right p-2">MSFT</th>
+                          <th className="text-right p-2">z-like</th>
+                          <th className="text-right p-2">Qty</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {mode === "live" && openTrades.map((t, i) => (
+                          <tr key={i} className="border-t border-gray-700">
+                            <td className="p-2">{new Date(t.timestamp).toLocaleString()}</td>
+                            <td className="p-2">{t.action}</td>
+                            <td className="p-2 text-right">{t.aapl_price?.toFixed?.(2) ?? "—"}</td>
+                            <td className="p-2 text-right">{t.msft_price?.toFixed?.(2) ?? "—"}</td>
+                            <td className="p-2 text-right">{t.z_like?.toFixed?.(2) ?? "—"}</td>
+                            <td className="p-2 text-right">{t.shares ?? 1}</td>
+                          </tr>
+                        ))}
+                        {mode === "backtest" && openTrades.map((t, i) => (
+                          <tr key={i} className="border-t border-gray-700">
+                            <td className="p-2">{new Date(t.timestamp || t.t).toLocaleString()}</td>
+                            <td className="p-2">{t.side}</td>
+                            <td className="p-2 text-right">{t.price1?.toFixed?.(2) ?? "—"}</td>
+                            <td className="p-2 text-right">{t.price2?.toFixed?.(2) ?? "—"}</td>
+                            <td className="p-2 text-right">—</td>
+                            <td className="p-2 text-right">{t.qty1 ?? "—"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            <Card className="bg-gray-800">
+              <CardContent>
+                <h2 className="text-lg font-semibold mb-3">Recent Closed Trades</h2>
+                {closedTrades.length === 0 ? (
+                  <div className="text-sm text-gray-400">None</div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead className="text-gray-400">
+                        <tr>
+                          <th className="text-left p-2">Closed</th>
+                          <th className="text-left p-2">Side</th>
+                          <th className="text-right p-2">PnL</th>
+                          <th className="text-right p-2">Held</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {mode === "live" && closedTrades.map((t, i) => (
+                          <tr key={i} className="border-t border-gray-700">
+                            <td className="p-2">{t.close_timestamp ? new Date(t.close_timestamp).toLocaleString() : (t.timestamp ? new Date(t.timestamp).toLocaleString() : "—")}</td>
+                            <td className="p-2">{t.action}</td>
+                            <td className={`p-2 text-right ${t.pnl > 0 ? "text-green-400" : (t.pnl < 0 ? "text-red-400" : "text-gray-300")}`}>
+                              {typeof t.pnl === "number" ? t.pnl.toFixed(2) : "—"}
+                            </td>
+                            <td className="p-2 text-right">—</td>
+                          </tr>
+                        ))}
+                        {mode === "backtest" && closedTrades.map((t, i) => (
+                          <tr key={i} className="border-t border-gray-700">
+                            <td className="p-2">{new Date(t.timestamp || t.t).toLocaleString()}</td>
+                            <td className="p-2">{t.side}</td>
+                            <td className={`p-2 text-right ${t.pnl > 0 ? "text-green-400" : (t.pnl < 0 ? "text-red-400" : "text-gray-300")}`}>
+                              {typeof t.pnl === "number" ? t.pnl.toFixed(2) : "—"}
+                            </td>
+                            <td className="p-2 text-right">{t.bars_held ?? "—"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </CardContent>
             </Card>
           </div>
