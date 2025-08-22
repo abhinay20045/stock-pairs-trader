@@ -154,6 +154,17 @@ export default function Dashboard() {
   // Mode
   const [mode, setMode] = useState("live"); // 'live' | 'backtest'
 
+  // ----- Strategy switching (frontend-only) -----
+  const STRATEGIES = useMemo(
+    () => [
+      { id: "pairs_basic", label: "Pairs: Basic" },
+      { id: "pairs_kalman", label: "Pairs: Kalman" },
+      { id: "pairs_ml", label: "Pairs: ML" }
+    ],
+    []
+  );
+  const [strategy, setStrategy] = useState(STRATEGIES[0].id);
+
   // Live data
   const [liveTrades, setLiveTrades] = useState(null);
   const [livePrices, setLivePrices] = useState(null);   // {AAPL:[{timestamp,close}], MSFT:[...]}
@@ -183,11 +194,13 @@ export default function Dashboard() {
     let stop = false;
     async function fetchLive() {
       try {
+        // include strategy param (non-breaking if backend ignores it)
+        const qs = `strategy=${encodeURIComponent(strategy)}`;
         const [tradeRes, priceRes, zscoreRes, pnlRes] = await Promise.all([
-          fetch("http://localhost:5050/trade-history"),
-          fetch("http://localhost:5050/prices?symbols=AAPL,MSFT&limit=50000"),
-          fetch("http://localhost:5050/stock-zscores"),
-          fetch("http://localhost:5050/pnl-history")
+          fetch(`http://localhost:5050/trade-history?${qs}`),
+          fetch(`http://localhost:5050/prices?symbols=AAPL,MSFT&limit=50000&${qs}`),
+          fetch(`http://localhost:5050/stock-zscores?${qs}`),
+          fetch(`http://localhost:5050/pnl-history?${qs}`)
         ]);
         if (stop) return;
         const [tradeJson, priceJson, zscoreJson, pnlJson] = await Promise.all([
@@ -207,7 +220,7 @@ export default function Dashboard() {
     fetchLive();
     const id = setInterval(fetchLive, 5000);
     return () => { stop = true; clearInterval(id); };
-  }, [mode]);
+  }, [mode, strategy]); // <- re-fetch when strategy changes
 
   // ------------------------ BACKTEST: launch + polling ------------------------
 
@@ -236,7 +249,10 @@ export default function Dashboard() {
       await fetch("http://localhost:5050/backtest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(DEFAULT_BT_PARAMS)
+        body: JSON.stringify({
+          ...DEFAULT_BT_PARAMS,
+          strategy // <-- include chosen strategy
+        })
       });
       setBtPhase("waiting");
       setBtMsg("Backtest started. Preparing data…");
@@ -245,7 +261,7 @@ export default function Dashboard() {
       setBtPhase("error");
       setBtMsg("Failed to start backtest.");
     }
-  }, [mode, btPhase]);
+  }, [mode, btPhase, strategy]);
 
   // Poll for the latest run that started after we clicked Backtest.
   useEffect(() => {
@@ -535,6 +551,20 @@ export default function Dashboard() {
     () => aggregateSeries(pnlRaw, binMs, "last", alignStart),
     [pnlRaw, binMs, alignStart]
   );
+  const pnlDisplayAgg = useMemo(() => {
+    if (!pnlAgg || pnlAgg.length !== 1) return pnlAgg;
+
+    const v = pnlAgg[0].value;
+    // avoid duplicate timestamps; nudge by ±1ms if needed
+    const startIso = new Date(windowStart + 1).toISOString();
+    const endIso   = new Date(windowEnd - 1).toISOString();
+
+    return [
+      { timestamp: startIso, value: v },
+      pnlAgg[0],
+      { timestamp: endIso, value: v }
+    ];
+  }, [pnlAgg, windowStart, windowEnd]);
   const aaplAgg = useMemo(
     () => aggregateSeries(aaplRaw, binMs, "avg", alignStart),
     [aaplRaw, binMs, alignStart]
@@ -725,21 +755,21 @@ export default function Dashboard() {
   );
 
   const pnlChartData = useMemo(
-    () => ({
-      labels: pnlAgg.map((p) => fmtLabel(p.timestamp, labelTimeframe)),
-      datasets: [
-        {
-          label: "Cumulative PnL",
-          data: pnlAgg.map((p) => p.value),
-          borderColor: "#10b981",
-          backgroundColor: "rgba(16,185,129,0.12)",
-          fill: true,
-          tension: 0.35
-        }
-      ]
-    }),
-    [pnlAgg, labelTimeframe]
-  );
+  () => ({
+    labels: (pnlDisplayAgg ?? []).map((p) => fmtLabel(p.timestamp, labelTimeframe)),
+    datasets: [
+      {
+        label: "Cumulative PnL",
+        data: (pnlDisplayAgg ?? []).map((p) => p.value),
+        borderColor: "#10b981",
+        backgroundColor: "rgba(16,185,129,0.12)",
+        fill: true,
+        tension: 0.35
+      }
+    ]
+  }),
+  [pnlDisplayAgg, labelTimeframe]
+);
 
   const aaplChartData = useMemo(
     () => ({
@@ -832,22 +862,39 @@ export default function Dashboard() {
           </button>
         </div>
 
-        {/* Live timeframe buttons (hidden in Backtest) */}
-        {mode === "live" && (
-          <div className="flex space-x-3">
-            {["week", "day", "hour"].map((tf) => (
-              <button
-                key={tf}
-                onClick={() => setTimeframe(tf)}
-                className={`px-4 py-2 rounded transition ${
-                  timeframe === tf ? "bg-blue-500" : "bg-gray-700 hover:bg-blue-600"
-                }`}
-              >
-                {tf.charAt(0).toUpperCase() + tf.slice(1)}
-              </button>
-            ))}
+        {/* Right-side controls: Strategy selector + Live timeframe */}
+        <div className="flex items-center gap-4">
+          {/* Strategy selector (shown in both modes) */}
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-gray-400">Strategy</span>
+            <select
+              value={strategy}
+              onChange={(e) => setStrategy(e.target.value)}
+              className="bg-gray-800 text-white text-sm rounded px-3 py-2"
+            >
+              {STRATEGIES.map((s) => (
+                <option key={s.id} value={s.id}>{s.label}</option>
+              ))}
+            </select>
           </div>
-        )}
+
+          {/* Live timeframe buttons (hidden in Backtest) */}
+          {mode === "live" && (
+            <div className="flex space-x-3">
+              {["week", "day", "hour"].map((tf) => (
+                <button
+                  key={tf}
+                  onClick={() => setTimeframe(tf)}
+                  className={`px-4 py-2 rounded transition ${
+                    timeframe === tf ? "bg-blue-500" : "bg-gray-700 hover:bg-blue-600"
+                  }`}
+                >
+                  {tf.charAt(0).toUpperCase() + tf.slice(1)}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Backtest status + meta */}
